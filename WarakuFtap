@@ -1,0 +1,2063 @@
+local Library = {Version = "1.0.0"}
+local windows = setmetatable({}, {__mode = "k"})
+local windowSerial = 0
+local function createWindow(windowOptions)
+local Players = game:GetService("Players")
+local Input = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+assert(player, "Menu must run on the client")
+-- Prefer an available hidden GUI host, then CoreGui; normal LocalScripts fall back.
+local parent
+local function tryHost(candidate)
+    if not candidate then return false end
+    local probe = Instance.new("ScreenGui")
+    local ok = pcall(function() probe.Parent = candidate end)
+    probe:Destroy()
+    if ok then parent = candidate end
+    return ok
+end
+if type(gethui) == "function" then
+    local ok, host = pcall(gethui)
+    if ok then tryHost(host) end
+end
+if not parent then
+    local ok, host = pcall(function() return game:GetService("CoreGui") end)
+    if ok then tryHost(host) end
+end
+if not parent then parent = player:WaitForChild("PlayerGui") end
+if windowOptions.parent then assert(tryHost(windowOptions.parent), "Cannot use parent") end
+local previous = parent:FindFirstChild(windowOptions.id)
+if previous then previous:Destroy() end
+
+local ACCENTS = {
+    Color3.fromRGB(155, 212, 90), Color3.fromRGB(90, 190, 212), Color3.fromRGB(150, 120, 235),
+    Color3.fromRGB(235, 120, 160), Color3.fromRGB(240, 176, 80),
+}
+local C = {
+    bg = Color3.fromRGB(26, 27, 31), panel = Color3.fromRGB(18, 19, 22),
+    row = Color3.fromRGB(25, 26, 30), rowHover = Color3.fromRGB(32, 34, 39),
+    box = Color3.fromRGB(47, 50, 55), text = Color3.fromRGB(100, 103, 111),
+    inactive = Color3.fromRGB(96, 97, 102), accent = ACCENTS[1],
+    stroke = Color3.fromRGB(44, 46, 52),
+}
+local labelColor = Color3.fromRGB(174, 178, 188)
+local titleColor = Color3.fromRGB(170, 174, 183)
+C.label = labelColor; C.title = titleColor
+
+-- Sprite data from the supplied catalog; bundled crops also work without HTTP.
+local ICON_URL = "https://raw.githubusercontent.com/whereesd0-star/Icons/refs/heads/main/Icons.lua.txt"
+local iconNames = {
+    crosshair = "crosshair-stroke",
+    eye = "eye-view-stroke",
+    settings = "cog-settings-01-stroke",
+    search = "search-stroke",
+    user = "profile-02-stroke",
+    shield = "folder-stroke",
+    check = "check-stroke",
+    sliders = "filter-sort-stroke",
+    target = "dashboard-01-stroke",
+    chevron = "down-chevron-stroke",
+    palette = "color-palette-01-stroke",
+}
+local icons = {
+    crosshair = {77139486329738, {96,96}, {768,768}},
+    eye = {116504596652500, {96,96}, {864,768}},
+    settings = {77139486329738, {96,96}, {576,288}},
+    search = {130202200859762, {96,96}, {864,768}},
+    user = {130202200859762, {96,96}, {480,192}},
+    shield = {122943914188262, {96,96}, {480,96}},
+    check = {90196769916139, {96,96}, {0,864}},
+    sliders = {116504596652500, {96,96}, {672,864}},
+    target = {77139486329738, {96,96}, {672,864}},
+    chevron = {116504596652500, {96,96}, {576,288}},
+    palette = {77139486329738, {96,96}, {672,384}},
+}
+
+local connections = {}
+local destroyed = false
+local unloading = false
+local gui, root
+local popup = {}
+local openPopup, closePopup
+local closeMini = function() end
+local motionSpeed = 1
+local menuKey = Enum.KeyCode.RightShift
+local themeBindings = setmetatable({}, {__mode = "k"})
+local activePicker
+local activeTweens = setmetatable({}, {__mode = "k"})
+
+----------------------------------------------------------------------
+-- helpers
+----------------------------------------------------------------------
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+-- Opacity scopes use ordinary Frames. Each property retains its own local value,
+-- including hover and text fades; nested scopes multiply their visibility.
+local visuals, fades = {}, {}
+local function renderVisual(item)
+    local record = visuals[item]
+    if not record then return end
+    local opacity, node = 1, item
+    while node do
+        if fades[node] then opacity = opacity * (1 - fades[node].Value) end
+        node = node.Parent
+    end
+    -- Rendered properties are output only. Roblox rounds GUI alpha to float32;
+    -- reading deferred property notifications back into local alpha causes drift.
+    for key, value in pairs(record.values) do
+        item[key] = math.clamp(1 - (1 - value.Value) * opacity, 0, 1)
+    end
+end
+local function renderTree(item)
+    renderVisual(item)
+    for _, child in ipairs(item:GetDescendants()) do renderVisual(child) end
+end
+local function bindTheme(item, key, value)
+    if typeof(value) ~= "Color3" then return end
+    if item:GetAttribute("NoTheme") then themeBindings[item] = nil; return end
+    local token
+    for name, color in pairs(C) do if color == value then token = name; break end end
+    local bindings = themeBindings[item] or {}
+    bindings[key] = token
+    themeBindings[item] = bindings
+end
+local function new(class, container, properties)
+    local item = Instance.new(class)
+    local fade = properties and properties.FadeTransparency
+    for key, value in pairs(properties or {}) do
+        if key ~= "FadeTransparency" then item[key] = value; bindTheme(item, key, value) end
+    end
+    item.Parent = container
+    local keys = {}
+    if item:IsA("GuiObject") then keys[#keys + 1] = "BackgroundTransparency" end
+    if class == "TextLabel" or class == "TextButton" or class == "TextBox" then
+        keys[#keys + 1] = "TextTransparency"; keys[#keys + 1] = "TextStrokeTransparency"
+    end
+    if class == "ImageLabel" or class == "ImageButton" then keys[#keys + 1] = "ImageTransparency" end
+    if class == "ScrollingFrame" then keys[#keys + 1] = "ScrollBarImageTransparency" end
+    if class == "UIStroke" then keys[#keys + 1] = "Transparency" end
+    local record = {values = {}, connections = {}}
+    local function listen(signal, fn) record.connections[#record.connections + 1] = signal:Connect(fn) end
+    if #keys > 0 then
+        visuals[item] = record
+        for _, key in ipairs(keys) do
+            local value = Instance.new("NumberValue")
+            value.Value = item[key]
+            record.values[key] = value
+            listen(value.Changed, function() renderVisual(item) end)
+        end
+    end
+    if fade ~= nil then
+        local value = Instance.new("NumberValue")
+        value.Value = fade; fades[item] = value
+        listen(value.Changed, function() renderTree(item) end)
+    end
+    if #keys > 0 or fade ~= nil then
+        listen(item:GetPropertyChangedSignal("Parent"), function() renderTree(item) end)
+        item.Destroying:Connect(function()
+            for _, connection in ipairs(record.connections) do connection:Disconnect() end
+            if activeTweens[item] then
+                for _, animation in pairs(activeTweens[item]) do animation:Cancel() end
+                activeTweens[item] = nil
+            end
+            for _, value in pairs(record.values) do value:Destroy() end
+            if fades[item] then fades[item]:Destroy(); fades[item] = nil end
+            visuals[item] = nil
+        end)
+        renderVisual(item)
+    end
+    return item
+end
+local function tween(inst, time, props, style, dir)
+    time = time / motionSpeed
+    local running = activeTweens[inst]
+    if not running then running = {}; activeTweens[inst] = running end
+    local last
+    -- Independent property channels: recoloring must not cancel movement/fades.
+    for key, value in pairs(props) do
+        bindTheme(inst, key, value)
+        if running[key] then running[key]:Cancel() end
+        local target, property = inst, key
+        if key == "FadeTransparency" then
+            target, property = assert(fades[inst]), "Value"
+        elseif visuals[inst] and visuals[inst].values[key] then
+            target, property = visuals[inst].values[key], "Value"
+        end
+        if destroyed or time <= 0 then
+            target[property] = value
+            running[key] = nil
+        else
+            local t = TweenService:Create(target,
+                TweenInfo.new(time, style or Enum.EasingStyle.Quart, dir or Enum.EasingDirection.Out),
+                {[property] = value})
+            running[key] = t
+            local done
+            done = t.Completed:Connect(function()
+                done:Disconnect()
+                if running[key] == t then running[key] = nil end
+            end)
+            t:Play()
+            last = t
+        end
+    end
+    return last
+end
+local function afterTween(animation, callback)
+    if not animation then return end
+    local done
+    done = animation.Completed:Connect(function(state)
+        done:Disconnect()
+        if not destroyed and state == Enum.PlaybackState.Completed then callback() end
+    end)
+end
+local positionFollowers = setmetatable({}, {__mode = "k"})
+local function followPosition(inst, target)
+    positionFollowers[inst] = target
+end
+connect(RunService.RenderStepped, function(dt)
+    if destroyed then return end
+    local alpha = 1 - math.exp(-dt / 0.035)
+    for inst, target in pairs(positionFollowers) do
+        if not inst.Parent then
+            positionFollowers[inst] = nil
+        else
+            local position = inst.Position:Lerp(target, alpha)
+            local error = math.abs(position.X.Offset - target.X.Offset) + math.abs(position.Y.Offset - target.Y.Offset)
+                + 1000 * (math.abs(position.X.Scale - target.X.Scale) + math.abs(position.Y.Scale - target.Y.Scale))
+            if error < 0.05 then
+                inst.Position = target
+                positionFollowers[inst] = nil
+            else
+                inst.Position = position
+            end
+        end
+    end
+end)
+local function stroke(item, color, transparency)
+    return new("UIStroke", item, {
+        Color = color or C.stroke, Thickness = 1, Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+end
+local function rect(container, name, x, y, w, h, color, radius)
+    local item = new("Frame", container, {
+        Name = name, Position = UDim2.fromOffset(x,y), Size = UDim2.fromOffset(w,h),
+        BackgroundColor3 = color, BorderSizePixel = 0,
+    })
+    if radius == "full" then
+        new("UICorner", item, {CornerRadius = UDim.new(1,0)})
+    elseif radius and radius > 0 then
+        new("UICorner", item, {CornerRadius = UDim.new(0,radius)})
+    end
+    return item
+end
+local fontFamily = windowOptions.fontFamily
+local face = fontFamily and Font.new(fontFamily, Enum.FontWeight.Medium)
+    or Font.fromEnum(Enum.Font.GothamMedium)
+local function label(container, name, text, x,y,w,h, color, size)
+    return new("TextLabel", container, {
+        Name = name, Text = text, Position = UDim2.fromOffset(x,y),
+        Size = UDim2.fromOffset(w,h), BackgroundTransparency = 1,
+        TextColor3 = color or C.text, TextSize = size or 14, FontFace = face,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+    })
+end
+local function icon(container, name, x,y,size,color)
+    local data = assert(icons[name], "Unknown icon: " .. name)
+    local item = new("ImageLabel", container, {
+        Name = name, BackgroundTransparency = 1, Position = UDim2.fromOffset(x,y),
+        Size = UDim2.fromOffset(size,size), Image = "rbxassetid://" .. data[1],
+        ImageRectSize = Vector2.new(data[2][1],data[2][2]),
+        ImageRectOffset = Vector2.new(data[3][1],data[3][2]), ImageColor3 = color or C.text,
+    })
+    item:SetAttribute("CatalogIcon", true)
+    item:SetAttribute("CatalogName", name)
+    return item
+end
+-- Shared session cache: no repeated HTTP/atlas preload when the library reloads.
+local cacheEnvironment = _G
+if type(getgenv) == "function" then
+    local ok, environment = pcall(getgenv)
+    if ok and type(environment) == "table" then cacheEnvironment = environment end
+end
+local cacheKey = "__SourceMenuIcons_v2"
+local iconCache = cacheEnvironment[cacheKey]
+if type(iconCache) ~= "table" or iconCache.url ~= ICON_URL then
+    iconCache = {url = ICON_URL, icons = icons, assets = {}, fetched = false, loading = false}
+    cacheEnvironment[cacheKey] = iconCache
+end
+if type(iconCache.icons) == "table" then icons = iconCache.icons end
+local function preloadIcons()
+    local ok, provider = pcall(function() return game:GetService("ContentProvider") end)
+    if not ok then return end
+    local assets = {}
+    for _, data in pairs(icons) do
+        local uri = "rbxassetid://" .. data[1]
+        if not iconCache.assets[uri] then iconCache.assets[uri] = "loading"; assets[#assets + 1] = uri end
+    end
+    if #assets == 0 then return end
+    local loaded = pcall(function()
+        provider:PreloadAsync(assets, function(uri, status)
+            iconCache.assets[uri] = status == Enum.AssetFetchStatus.Success and true or nil
+        end)
+    end)
+    if not loaded then for _, uri in ipairs(assets) do iconCache.assets[uri] = nil end end
+end
+task.spawn(preloadIcons)
+-- Fetch asynchronously; the menu remains usable if client HTTP is unavailable.
+-- Only asset IDs and crop coordinates are parsed; remote source is never executed.
+task.spawn(function()
+    if iconCache.fetched or iconCache.loading then return end
+    iconCache.loading = true
+    local ok, source = pcall(function() return HttpService:GetAsync(ICON_URL) end)
+    if not ok then ok, source = pcall(function() return game:HttpGet(ICON_URL) end) end
+    iconCache.loading = false
+    if not ok or type(source) ~= "string" or #source > 1000000 then return end
+    local sheets = {}
+    for id, assetId in source:gmatch('%["(%d+)"%]%s*=%s*"rbxassetid://(%d+)"') do sheets[tonumber(id)] = assetId end
+    for alias, name in pairs(iconNames) do
+        local body = source:match('%["' .. name:gsub("%-", "%%-") .. '"%]%s*=%s*{(.-)}')
+        if body then
+            local x, y = body:match("ImageRectPosition%s*=%s*Vector2%.new%(%s*(%d+)%s*,%s*(%d+)%s*%)")
+            local w, h = body:match("ImageRectSize%s*=%s*Vector2%.new%(%s*(%d+)%s*,%s*(%d+)%s*%)")
+            local id = tonumber(body:match("Image%s*=%s*(%d+)"))
+            if x and w and sheets[id] and tonumber(w) > 0 and tonumber(h) > 0 then
+                icons[alias] = {sheets[id], {tonumber(w), tonumber(h)}, {tonumber(x), tonumber(y)}}
+            end
+        end
+    end
+    iconCache.icons = icons; iconCache.fetched = true
+    preloadIcons()
+    if gui and not destroyed then
+        for _, item in ipairs(gui:GetDescendants()) do
+            local data = icons[item:GetAttribute("CatalogName") or item.Name]
+            if item:IsA("ImageLabel") and item:GetAttribute("CatalogIcon") and data then
+                item.Image = "rbxassetid://" .. data[1]
+                item.ImageRectSize = Vector2.new(data[2][1], data[2][2])
+                item.ImageRectOffset = Vector2.new(data[3][1], data[3][2])
+            end
+        end
+    end
+end)
+local function hit(container, name, x,y,w,h)
+    return new("TextButton", container, {
+        Name = name, Position = UDim2.fromOffset(x,y), Size = UDim2.fromOffset(w,h),
+        BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+    })
+end
+local function ord(container)
+    local n = (container:GetAttribute("n") or 0) + 1
+    container:SetAttribute("n", n)
+    return n
+end
+
+-- accent color registry: everything that uses the accent recolors smoothly
+local accentItems, refreshers = {}, {}
+local function useAccent(inst, prop)
+    table.insert(accentItems, {inst, prop or "BackgroundColor3"})
+    return inst
+end
+local function setAccent(color)
+    C.accent = color
+    for _, item in ipairs(accentItems) do
+        if item[1].Parent then tween(item[1], 0.3, {[item[2]] = color}) end
+    end
+    for _, fn in ipairs(refreshers) do fn() end
+end
+
+local function asset(container, name, uri, fallback, x,y,w,h)
+    if uri and uri ~= "" then
+        return new("ImageLabel", container, {
+            Name = name, Image = uri, BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(x,y), Size = UDim2.fromOffset(w,h),
+            ScaleType = Enum.ScaleType.Stretch,
+        })
+    end
+    return useAccent(icon(container, fallback, x,y,math.min(w,h),C.accent), "ImageColor3")
+end
+
+----------------------------------------------------------------------
+-- settings schema
+----------------------------------------------------------------------
+local changed = Instance.new("BindableEvent")
+local api = {State = {}, Tab = 0, Changed = changed.Event}
+local defs, byKey, syncs, hooks = {}, {}, {}, {}
+local function copyValue(value)
+    if type(value) ~= "table" then return value end
+    local result = {}
+    for key, item in pairs(value) do result[key] = copyValue(item) end
+    return result
+end
+local function sameValue(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return a == b end
+    for key, value in pairs(a) do if not sameValue(value, b[key]) then return false end end
+    for key in pairs(b) do if a[key] == nil then return false end end
+    return true
+end
+local function def(d)
+    assert(type(d.key) == "string" and not byKey[d.key], "Control keys must be unique strings")
+    d.value = copyValue(d.value)
+    table.insert(defs, d)
+    byKey[d.key] = d
+    syncs[d.key] = {}
+    api.State[d.key] = copyValue(d.value)
+    return d
+end
+-- Settings
+def{key="uiScale", kind="slider", text="menu scale", value=100, min=70, max=120, step=5, suffix="%"}
+def{key="accent", kind="swatch", text="accent color", value=1, colors=ACCENTS}
+
+-- Configuration tools stay in the built-in Settings tab.
+def{key="configName", kind="input", text="config name", value="default", maxLength=64, transient=true, searchable=false}
+def{key="configProfile", kind="dropdown", text="saved profiles", value="", options={}, transient=true, searchable=false}
+def{key="configJson", kind="input", text="config JSON", value="", placeholder="export or paste JSON here", multiline=true, height=160, maxLength=131072, transient=true, searchable=false}
+def{key="configStatus", kind="label", text="config status", value="Profiles last for this session. Export JSON to keep them between launches.", height=76, maxLength=2048, transient=true, searchable=false}
+
+----------------------------------------------------------------------
+-- controls
+----------------------------------------------------------------------
+local controls = {}
+local activeSlider
+
+local function row(container, h)
+    local frame = rect(container, "Row", 0, 0, 242, h, C.row, 12)
+    frame.LayoutOrder = ord(container)
+    local line = stroke(frame, C.stroke, 0.5)
+    return frame, line
+end
+local function hoverRow(frame, button)
+    local line = frame:FindFirstChildOfClass("UIStroke")
+    local caption = frame:FindFirstChild("Label")
+    local function update(hovered)
+        tween(frame, 0.16, {BackgroundColor3 = hovered and C.rowHover or C.row})
+        if line then tween(line, 0.16, {Color = hovered and C.accent or C.stroke, Transparency = hovered and 0.3 or 0.5}) end
+        if caption then tween(caption, 0.16, {TextColor3 = hovered and titleColor or labelColor}) end
+    end
+    connect(button.MouseEnter, function() update(true) end)
+    connect(button.MouseLeave, function() update(false) end)
+end
+
+controls.toggle = function(container, d)
+    local frame = row(container, 38)
+    label(frame, "Label", d.text, 14, 0, 172, 38, labelColor, 14)
+    local track = rect(frame, "Track", 194, 9, 36, 20, C.box, "full")
+    local thumb = rect(track, "Thumb", 3, 3, 14, 14, C.inactive, "full")
+    local function sync(animated)
+        local on = api.State[d.key]
+        local t = animated and 0.22 or 0
+        tween(track, t, {BackgroundColor3 = on and C.accent or C.box})
+        tween(thumb, t, {
+            Position = UDim2.fromOffset(on and 19 or 3, 3),
+            BackgroundColor3 = on and C.panel or Color3.fromRGB(137,142,152),
+        })
+    end
+    table.insert(syncs[d.key], sync)
+    table.insert(refreshers, function() sync(true) end)
+    sync(false)
+    local button = hit(frame, "Toggle", 0, 0, 242, 38)
+    connect(button.Activated, function() api:Set(d.key, not api.State[d.key]) end)
+    hoverRow(frame, button)
+    return frame
+end
+
+controls.slider = function(container, d)
+    local frame = row(container, 52)
+    label(frame, "Label", d.text, 14, 6, 120, 22, labelColor, 14)
+    local valueLabel = useAccent(label(frame, "Value", "", 120, 6, 108, 22, C.accent, 13), "TextColor3")
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    local track = rect(frame, "Track", 14, 38, 214, 6, C.box, "full")
+    local fill = useAccent(rect(track, "Fill", 0, 0, 0, 6, C.accent, "full"))
+    local knob = rect(track, "Knob", 0, 0, 14, 14, C.panel, "full")
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Position = UDim2.fromScale(0, 0.5)
+    local ring = stroke(knob, C.accent, 0)
+    ring.Thickness = 2
+    useAccent(ring, "Color")
+    local displayed = new("NumberValue", frame, {Name = "DisplayedValue", Value = api.State[d.key]})
+    local function drawValue()
+        local v = displayed.Value
+        local ratio = math.clamp((v - d.min) / (d.max - d.min), 0, 1)
+        valueLabel.Text = string.format("%." .. (d.decimals or 0) .. "f", v) .. (d.suffix or "")
+        fill.Size = UDim2.fromScale(ratio, 1)
+        knob.Position = UDim2.fromScale(ratio, 0.5)
+    end
+    connect(displayed.Changed, drawValue)
+    local function sync(animated)
+        tween(displayed, animated and 0.14 or 0, {Value = api.State[d.key]})
+        if not animated then drawValue() end
+    end
+    table.insert(syncs[d.key], sync)
+    sync(false)
+    local function fromX(x, gx, gw)
+        local w = gw or track.AbsoluteSize.X
+        if w <= 0 then return end
+        local t = math.clamp((x - (gx or track.AbsolutePosition.X)) / w, 0, 1)
+        local v = d.min + t * (d.max - d.min)
+        v = math.floor(v / d.step + 0.5) * d.step
+        v = tonumber(string.format("%.4f", math.clamp(v, d.min, d.max)))
+        api:Set(d.key, v)
+    end
+    local button = hit(frame, "Hit", 0, 0, 242, 52)
+    connect(button.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            local gx, gw = track.AbsolutePosition.X, track.AbsoluteSize.X
+            activeSlider = {fromX = fromX, knob = knob, input = input, gx = gx, gw = gw}
+            tween(knob, 0.12, {Size = UDim2.fromOffset(16, 16)})
+            fromX(input.Position.X, gx, gw)
+        end
+    end)
+    hoverRow(frame, button)
+    return frame
+end
+
+controls.select = function(container, d)
+    local frame = row(container, 62)
+    label(frame, "Label", d.text, 14, 6, 214, 20, labelColor, 14)
+    local bar = rect(frame, "Bar", 14, 32, 214, 24, C.box, "full")
+    local n = #d.options
+    local w = 214 / n
+    local pill = useAccent(rect(bar, "Pill", 2, 2, w - 4, 20, C.accent, "full"))
+    local buttons = {}
+    for i, option in ipairs(d.options) do
+        local b = new("TextButton", bar, {
+            Name = "Option" .. i, Position = UDim2.fromOffset((i - 1) * w, 0),
+            Size = UDim2.fromOffset(w, 24), BackgroundTransparency = 1, Text = option,
+            TextSize = 12, FontFace = face, TextColor3 = Color3.fromRGB(140,144,153),
+            AutoButtonColor = false, ZIndex = 2,
+        })
+        buttons[i] = b
+        connect(b.Activated, function() api:Set(d.key, option) end)
+    end
+    local function sync(animated)
+        local current = api.State[d.key]
+        local t = animated and 0.22 or 0
+        for i, option in ipairs(d.options) do
+            local selected = option == current
+            if selected then tween(pill, t, {Position = UDim2.fromOffset(2 + (i - 1) * w, 2)}) end
+            tween(buttons[i], animated and 0.2 or 0, {
+                TextColor3 = selected and C.panel or Color3.fromRGB(140,144,153),
+            })
+        end
+    end
+    table.insert(syncs[d.key], sync)
+    sync(false)
+    for _, optionButton in ipairs(buttons) do hoverRow(frame, optionButton) end
+    return frame
+end
+
+controls.swatch = function(container, d)
+    local frame = row(container, 62)
+    label(frame, "Label", d.text, 14, 6, 214, 20, labelColor, 14)
+    local rings = {}
+    for i, color in ipairs(d.colors) do
+        local dot = rect(frame, "Swatch" .. i, 14 + (i - 1) * 34, 32, 24, 24, color, "full")
+        dot:SetAttribute("NoTheme", true); themeBindings[dot] = nil
+        local ring = stroke(dot, Color3.fromRGB(235,238,244), 1)
+        ring.Thickness = 2
+        rings[i] = ring
+        local button = hit(dot, "Pick", 0, 0, 24, 24)
+        connect(button.Activated, function() api:Set(d.key, i) end)
+        local hovered, pressed = false, false
+        local function updateDot()
+            local size = pressed and 22 or hovered and 26 or 24
+            local offset = (24 - size) * 0.5
+            tween(dot, pressed and 0.10 or 0.16, {
+                Size = UDim2.fromOffset(size, size),
+                Position = UDim2.fromOffset(14 + (i - 1) * 34 + offset, 32 + offset),
+            })
+            tween(ring, 0.16, {Thickness = hovered and 2.5 or 2})
+        end
+        connect(button.MouseEnter, function() hovered = true; updateDot() end)
+        connect(button.MouseLeave, function() hovered = false; pressed = false; updateDot() end)
+        connect(button.MouseButton1Down, function() pressed = true; updateDot() end)
+        connect(button.MouseButton1Up, function() pressed = false; updateDot() end)
+    end
+    local function sync(animated)
+        for i, ring in ipairs(rings) do
+            tween(ring, animated and 0.2 or 0, {Transparency = i == api.State[d.key] and 0 or 1})
+        end
+    end
+    table.insert(syncs[d.key], sync)
+    sync(false)
+    return frame
+end
+
+-- Basic controls share the same schema, Changed signal and animation channels.
+controls.label = function(container, d)
+    local frame = row(container, d.height or 56)
+    local text = label(frame, "Label", "", 14, 8, 214, (d.height or 56) - 16, labelColor, 13)
+    text.TextWrapped = true
+    text.TextYAlignment = Enum.TextYAlignment.Top
+    local revision = 0
+    local function sync(animated)
+        revision = revision + 1
+        local id, value = revision, api.State[d.key]
+        if not animated then text.Text = value; return end
+        afterTween(tween(text, 0.08, {TextTransparency = 1}), function()
+            if id ~= revision then return end
+            text.Text = value
+            tween(text, 0.16, {TextTransparency = 0})
+        end)
+    end
+    table.insert(syncs[d.key], sync); sync(false)
+    return frame
+end
+controls.input = function(container, d)
+    local height = d.multiline and (d.height or 148) or 64
+    local frame = row(container, height)
+    label(frame, "Label", d.text, 14, 5, 214, 22, labelColor, 14)
+    local box = new("TextBox", frame, {
+        Name = "Input", Position = UDim2.fromOffset(14, 32), Size = UDim2.fromOffset(214, height - 40),
+        BackgroundColor3 = C.box, BorderSizePixel = 0, Text = "", ClearTextOnFocus = false,
+        PlaceholderText = d.placeholder or "enter text", PlaceholderColor3 = C.text,
+        TextColor3 = titleColor, FontFace = face, TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = d.multiline and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+        MultiLine = d.multiline or false, TextWrapped = d.multiline or false,
+    })
+    new("UICorner", box, {CornerRadius = UDim.new(0, 7)})
+    new("UIPadding", box, {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, d.multiline and 6 or 0)})
+    local line = stroke(box, C.stroke, 0.5)
+    local function sync()
+        if not box:IsFocused() then box.Text = api.State[d.key] end
+    end
+    table.insert(syncs[d.key], sync); sync()
+    connect(box.Focused, function() tween(line, 0.16, {Color = C.accent, Transparency = 0.1}) end)
+    connect(box.FocusLost, function()
+        tween(line, 0.16, {Color = C.stroke, Transparency = 0.5})
+        local ok = pcall(function() api:Set(d.key, box.Text) end)
+        box.Text = api.State[d.key]
+        if not ok then line.Color = Color3.fromRGB(225, 105, 105); tween(line, 0.3, {Color = C.stroke}) end
+    end)
+    return frame
+end
+local function dropdownControl(container, d, multiple)
+    local frame = row(container, 64)
+    label(frame, "Label", d.text, 14, 5, 214, 22, labelColor, 14)
+    local field = rect(frame, "Field", 14, 32, 214, 24, C.box, 7)
+    local caption = label(field, "Value", "", 8, 0, 174, 24, titleColor, 12)
+    caption.TextTruncate = Enum.TextTruncate.AtEnd
+    local arrow = icon(field, "chevron", 188, 5, 14, labelColor)
+    local line = stroke(field, C.stroke, 0.5)
+    local function sync()
+        local value = api.State[d.key]
+        caption.Text = multiple and (#value > 0 and table.concat(value, ", ") or "none selected")
+            or (value ~= "" and value or "no options")
+    end
+    table.insert(syncs[d.key], sync); sync()
+    local pick = hit(field, "Expand", 0, 0, 214, 24)
+    hoverRow(frame, pick)
+    connect(pick.Activated, function()
+        if popup.anchor == field then closePopup(); return end
+        tween(arrow, 0.18, {Rotation = 180})
+        tween(line, 0.16, {Color = C.accent, Transparency = 0.1})
+        openPopup(field, 218, math.min(190, math.max(42, #d.options * 30 + 12)), function(panel, listen, close)
+            local list = new("ScrollingFrame", panel, {
+                Name = "Options", BackgroundTransparency = 1, BorderSizePixel = 0, Active = true,
+                Position = UDim2.fromOffset(6, 6), Size = UDim2.new(1, -12, 1, -12),
+                CanvasSize = UDim2.fromOffset(0, #d.options * 30), ScrollBarThickness = 2,
+                ScrollBarImageColor3 = C.accent, ScrollingDirection = Enum.ScrollingDirection.Y,
+            })
+            if #d.options == 0 then label(list, "Empty", "no options", 8, 0, 180, 28, C.text, 12) end
+            local options = {}
+            for i, option in ipairs(d.options) do
+                local tile = rect(list, "Option" .. i, 0, (i - 1) * 30, 202, 28, C.panel, 6)
+                local text = label(tile, "Text", option, 9, 0, 163, 28, labelColor, 12)
+                text.TextTruncate = Enum.TextTruncate.AtEnd
+                local check = icon(tile, "check", 178, 7, 14, C.accent)
+                local button = hit(tile, "Choose", 0, 0, 202, 28)
+                options[#options + 1] = {value = option, tile = tile, text = text, check = check}
+                listen(button.MouseEnter, function() tween(tile, 0.14, {BackgroundColor3 = C.rowHover}) end)
+                listen(button.MouseLeave, function() tween(tile, 0.14, {BackgroundColor3 = C.panel}) end)
+                listen(button.Activated, function()
+                    if multiple then
+                        local value = api:Get(d.key)
+                        local index = table.find(value, option)
+                        if index then table.remove(value, index) else table.insert(value, option) end
+                        api:Set(d.key, value)
+                    else
+                        api:Set(d.key, option); close()
+                    end
+                end)
+            end
+            local function refresh(animated)
+                local value = api.State[d.key]
+                for _, item in ipairs(options) do
+                    local selected = multiple and table.find(value, item.value) ~= nil or (not multiple and value == item.value)
+                    tween(item.text, animated and 0.16 or 0, {TextColor3 = selected and C.accent or labelColor})
+                    tween(item.check, animated and 0.16 or 0, {ImageTransparency = selected and 0 or 1})
+                end
+            end
+            listen(api.Changed, function(key) if key == d.key then refresh(true) end end)
+            refresh(false)
+        end, function()
+            tween(arrow, 0.18, {Rotation = 0})
+            tween(line, 0.16, {Color = C.stroke, Transparency = 0.5})
+        end)
+    end)
+    return frame
+end
+controls.dropdown = function(container, d) return dropdownControl(container, d, false) end
+controls.multidropdown = function(container, d) return dropdownControl(container, d, true) end
+controls.color = function(container, d)
+    local frame = d.inline and rect(container, "InlineColor", 0, 0, 24, 24, C.box, 6) or row(container, 64)
+    if not d.inline then label(frame, "Label", d.text, 14, 5, 214, 22, labelColor, 14) end
+    local field = d.inline and frame or rect(frame, "Field", 14, 32, 214, 24, C.box, 7)
+    local caption = not d.inline and label(field, "Value", "", 8, 0, 166, 24, titleColor, 12) or nil
+    local preview = d.inline and rect(field, "Preview", 4, 4, 16, 16, api.State[d.key], 4)
+        or rect(field, "Preview", 178, 4, 28, 16, api.State[d.key], 4)
+    preview:SetAttribute("NoTheme", true); themeBindings[preview] = nil
+    local function sync(animated)
+        local value = api.State[d.key]
+        if caption then caption.Text = "#" .. value:ToHex():upper() end
+        tween(preview, animated and 0.16 or 0, {BackgroundColor3 = value})
+    end
+    table.insert(syncs[d.key], sync); sync(false)
+    local pick = hit(field, "PickColor", 0, 0, d.inline and 24 or 214, 24)
+    hoverRow(frame, pick)
+    connect(pick.Activated, function()
+        if popup.anchor == field then closePopup(); return end
+        openPopup(field, 234, 244, function(panel, listen, close)
+            local original = api.State[d.key]
+            local h, s, v = original:ToHSV()
+            icon(panel, "palette", 10, 9, 16, C.accent)
+            local heading = label(panel, "Heading", d.text or "Color", 36, 6, 188, 24, titleColor, 13)
+            heading.TextTruncate = Enum.TextTruncate.AtEnd
+            local square = rect(panel, "SaturationValue", 10, 36, 214, 94, Color3.new(1, 1, 1), 6)
+            local saturation = new("UIGradient", square, {Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(h, 1, 1))})
+            local shade = rect(square, "ValueShade", 0, 0, 214, 94, Color3.new(0, 0, 0), 6)
+            new("UIGradient", shade, {
+                Rotation = 90, Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0)}),
+            })
+            local cursor = rect(square, "Cursor", 0, 0, 10, 10, original, "full")
+            cursor.AnchorPoint = Vector2.new(0.5, 0.5); cursor.ZIndex = 3
+            stroke(cursor, Color3.new(1, 1, 1), 0).Thickness = 2
+            local hue = rect(panel, "Hue", 10, 142, 214, 12, Color3.new(1, 1, 1), "full")
+            local keys = {}
+            for i = 0, 6 do keys[#keys + 1] = ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6, 1, 1)) end
+            new("UIGradient", hue, {Color = ColorSequence.new(keys)})
+            local hueMarker = rect(hue, "Marker", 0, 6, 8, 18, Color3.fromHSV(h, 1, 1), 4)
+            hueMarker.AnchorPoint = Vector2.new(0.5, 0.5); hueMarker.ZIndex = 3
+            stroke(hueMarker, Color3.new(1, 1, 1), 0).Thickness = 2
+            local function input(name, x, width, caption)
+                label(panel, name .. "Label", caption, x, 164, width, 14, C.text, 10)
+                local box = new("TextBox", panel, {
+                    Name = name, Position = UDim2.fromOffset(x, 180), Size = UDim2.fromOffset(width, 24),
+                    BackgroundColor3 = C.box, BorderSizePixel = 0, ClearTextOnFocus = false,
+                    Text = "", FontFace = face, TextSize = 12, TextColor3 = titleColor,
+                })
+                new("UICorner", box, {CornerRadius = UDim.new(0, 5)})
+                local edge = stroke(box, C.stroke, 0.5)
+                listen(box.Focused, function() tween(edge, 0.16, {Color = C.accent}) end)
+                listen(box.FocusLost, function() tween(edge, 0.16, {Color = C.stroke}) end)
+                return box, edge
+            end
+            local hex, hexStroke = input("Hex", 10, 80, "HEX")
+            local channels, channelStrokes = {}, {}
+            for i, name in ipairs({"R", "G", "B"}) do channels[i], channelStrokes[i] = input(name, 98 + (i - 1) * 43, 40, name) end
+            local oldPreview = rect(panel, "Original", 10, 218, 22, 14, original, 4)
+            local newPreview = rect(panel, "Current", 36, 218, 22, 14, original, 4)
+            for _, colorSample in ipairs({cursor, hueMarker, oldPreview, newPreview}) do
+                colorSample:SetAttribute("NoTheme", true); themeBindings[colorSample] = nil
+            end
+            local reset = hit(panel, "Reset", 66, 212, 72, 24)
+            reset.Text = "Reset"; reset.FontFace = face; reset.TextSize = 12; reset.TextColor3 = titleColor
+            local done = hit(panel, "Done", 150, 212, 74, 24)
+            tween(done, 0, {BackgroundTransparency = 0}); done.BackgroundColor3 = C.accent
+            done.Text = "Done"; done.FontFace = face; done.TextSize = 12; done.TextColor3 = C.panel
+            new("UICorner", done, {CornerRadius = UDim.new(0, 6)})
+            listen(done.Activated, close)
+            listen(reset.Activated, function() api:Set(d.key, original) end)
+            local function refresh(animated, preserveHSV)
+                local color = api.State[d.key]
+                if not preserveHSV then
+                    local nh, ns, nv = color:ToHSV()
+                    if ns > 0.0001 and nv > 0.0001 then h = nh end
+                    if nv > 0.0001 then s = ns end
+                    v = nv
+                end
+                saturation.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(h, 1, 1))
+                -- Cursor centers remain inside the palette, including its rounded edges.
+                tween(cursor, animated and 0.06 or 0, {Position = UDim2.fromOffset(5 + s * 204, 5 + (1 - v) * 84), BackgroundColor3 = color})
+                tween(hueMarker, animated and 0.06 or 0, {Position = UDim2.fromOffset(4 + h * 206, 6), BackgroundColor3 = Color3.fromHSV(h, 1, 1)})
+                tween(newPreview, animated and 0.10 or 0, {BackgroundColor3 = color})
+                if not hex:IsFocused() then hex.Text = "#" .. color:ToHex():upper() end
+                local values = {color.R, color.G, color.B}
+                for i, box in ipairs(channels) do
+                    if not box:IsFocused() then box.Text = tostring(math.floor(values[i] * 255 + 0.5)) end
+                end
+            end
+            local dragging = false
+            local function commitHSV()
+                dragging = true
+                api:Set(d.key, Color3.fromHSV(h, s, v))
+                dragging = false
+                refresh(true, true)
+            end
+            local function bindArea(area, update, extra)
+                local button = hit(area, "Drag", 0, -(extra or 0), area.Size.X.Offset, area.Size.Y.Offset + 2 * (extra or 0))
+                button.ZIndex = 4
+                listen(button.InputBegan, function(input)
+                    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        activePicker = {input = input, update = update}; update(input.Position)
+                    end
+                end)
+            end
+            bindArea(square, function(position)
+                local sx = square.AbsoluteSize.X / 214
+                local sy = square.AbsoluteSize.Y / 94
+                s = math.clamp((position.X - square.AbsolutePosition.X - 5 * sx) / math.max(1, 204 * sx), 0, 1)
+                v = 1 - math.clamp((position.Y - square.AbsolutePosition.Y - 5 * sy) / math.max(1, 84 * sy), 0, 1)
+                commitHSV()
+            end)
+            bindArea(hue, function(position)
+                local factor = hue.AbsoluteSize.X / 214
+                h = math.clamp((position.X - hue.AbsolutePosition.X - 4 * factor) / math.max(1, 206 * factor), 0, 1)
+                commitHSV()
+            end, 5)
+            listen(hex.FocusLost, function()
+                local value = hex.Text:match("^%s*#?(%x+)%s*$")
+                if value and #value == 3 then value = value:gsub("(.)", "%1%1") end
+                if value and #value == 6 then api:Set(d.key, Color3.fromHex(value))
+                else hexStroke.Color = Color3.fromRGB(225, 105, 105); tween(hexStroke, 0.35, {Color = C.stroke}) end
+                hex.Text = "#" .. api.State[d.key]:ToHex():upper()
+            end)
+            for i, box in ipairs(channels) do
+                listen(box.FocusLost, function()
+                    local number = tonumber(box.Text)
+                    if number and number == number and number >= 0 and number <= 255 and number % 1 == 0 then
+                        local color = api.State[d.key]
+                        local values = {math.floor(color.R * 255 + 0.5), math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5)}
+                        values[i] = number
+                        api:Set(d.key, Color3.fromRGB(values[1], values[2], values[3]))
+                    else
+                        channelStrokes[i].Color = Color3.fromRGB(225, 105, 105)
+                        tween(channelStrokes[i], 0.35, {Color = C.stroke})
+                    end
+                    refresh(true)
+                end)
+            end
+            listen(api.Changed, function(key) if key == d.key then refresh(true, dragging) end end)
+            refresh(false)
+        end)
+    end)
+    return frame
+end
+
+local function section(container, text, width)
+    local w = width or 242
+    local f = new("Frame", container, {
+        Name = "Section", BackgroundTransparency = 1,
+        Size = UDim2.fromOffset(w, 20), LayoutOrder = ord(container),
+    })
+    useAccent(rect(f, "Bar", 0, 4, 3, 12, C.accent, "full"))
+    label(f, "Title", text, 10, 0, w - 10, 20, titleColor, 14)
+    return f
+end
+local function info(container, text, value)
+    local frame = row(container, 38)
+    label(frame, "Label", text, 14, 0, 140, 38, labelColor, 14)
+    local pill = rect(frame, "Key", 158, 7, 72, 24, C.box, "full")
+    local v = label(pill, "Value", value, 0, 0, 72, 24, titleColor, 12)
+    v.TextXAlignment = Enum.TextXAlignment.Center
+    return frame
+end
+local function button(container, text, callback)
+    local frame, line = row(container, 34)
+    local caption = label(frame, "Label", text, 0, 0, 242, 34, labelColor, 14)
+    caption.TextXAlignment = Enum.TextXAlignment.Center
+    local b = hit(frame, "Click", 0, 0, 242, 34)
+    connect(b.MouseEnter, function()
+        tween(frame, 0.16, {BackgroundColor3 = C.rowHover})
+        tween(line, 0.16, {Color = C.accent, Transparency = 0.2})
+        tween(caption, 0.16, {TextColor3 = titleColor})
+    end)
+    connect(b.MouseLeave, function()
+        tween(frame, 0.16, {BackgroundColor3 = C.row})
+        tween(line, 0.16, {Color = C.stroke, Transparency = 0.5})
+        tween(caption, 0.16, {TextColor3 = labelColor})
+    end)
+    connect(b.MouseButton1Down, function() tween(frame, 0.10, {BackgroundColor3 = C.panel}) end)
+    connect(b.MouseButton1Up, function() tween(frame, 0.16, {BackgroundColor3 = C.rowHover}) end)
+    connect(b.Activated, callback)
+    return frame
+end
+
+controls.button = function(container, d)
+    return button(container, d.text, function()
+        api:Set(d.key, api.State[d.key] + 1)
+        if d.callback then d.callback(api) end
+    end)
+end
+
+----------------------------------------------------------------------
+-- window
+----------------------------------------------------------------------
+gui = new("ScreenGui", parent, {
+    Name = windowOptions.id, ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 50, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+-- Composite opacity leaves local text/stroke/hover animation values intact.
+root = new("Frame", gui, {
+    Name = "Window", Size = UDim2.fromOffset(600, 370),
+    BackgroundColor3 = C.bg, BorderSizePixel = 0,
+    FadeTransparency = 1, Visible = false,
+})
+new("UICorner", root, {CornerRadius = UDim.new(0, 16)})
+root.AnchorPoint = Vector2.new(0.5, 0.5)
+root.Position = UDim2.fromScale(0.5, 0.5)
+-- The inset border shares the same opacity scope as the entire window.
+local border = rect(root, "WindowBorder", 1, 1, 598, 368, C.bg, 15)
+tween(border, 0, {BackgroundTransparency = 1})
+border.ZIndex = 99
+stroke(border, C.stroke, 0)
+local winVeil = hit(root, "TransitionInputShield", 0, 0, 600, 370)
+winVeil.ZIndex = 100
+winVeil.Active = true
+winVeil.Visible = false
+local scale = new("UIScale", root, {Scale = 1})
+local homePos = root.Position
+local intro = new("NumberValue", gui, {Name = "MotionScale"})
+intro.Value = 1
+local userScale = new("NumberValue", gui, {Name = "UserScale"})
+userScale.Value = (api.State.uiScale or 100) / 100
+local function fit()
+    local size = gui.AbsoluteSize
+    local base = math.min(userScale.Value, math.max(0.1, (size.X - 24) / 600), math.max(0.1, (size.Y - 24) / 370))
+    scale.Scale = base * intro.Value
+end
+connect(gui:GetPropertyChangedSignal("AbsoluteSize"), fit)
+connect(intro.Changed, fit)
+connect(userScale.Changed, fit)
+fit()
+
+-- Popups live above clipped pages; listeners are disposed on every close.
+closePopup = function(immediate)
+    local current = popup.current
+    if not current then return end
+    popup.current = nil; popup.anchor = nil; activePicker = nil
+    for _, connection in ipairs(current.connections) do connection:Disconnect() end
+    if current.onClose then current.onClose() end
+    if immediate or destroyed then
+        current.overlay:Destroy()
+    else
+        afterTween(tween(current.panel, 0.12, {FadeTransparency = 1}), function() current.overlay:Destroy() end)
+    end
+end
+openPopup = function(anchor, width, height, build, onClose)
+    if destroyed or unloading or not api.Open then return end
+    closePopup(true)
+    local factor = math.max(0.01, root.AbsoluteSize.X / 600)
+    local relative = (anchor.AbsolutePosition - root.AbsolutePosition) / factor
+    local x = math.clamp(relative.X, 8, 600 - width - 8)
+    local y = relative.Y + anchor.AbsoluteSize.Y / factor + 5
+    if y + height > 362 then y = math.max(8, relative.Y - height - 5) end
+    local overlay = hit(root, "PopupOverlay", 0, 0, 600, 370)
+    overlay.ZIndex = 120
+    local panel = new("Frame", overlay, {
+        Name = "Popup", Position = UDim2.fromOffset(x, y + 4), Size = UDim2.fromOffset(width, height),
+        BackgroundColor3 = C.panel, BorderSizePixel = 0, FadeTransparency = 1, ZIndex = 2,
+    })
+    new("UICorner", panel, {CornerRadius = UDim.new(0, 10)})
+    local edge = rect(panel, "Border", 1, 1, width - 2, height - 2, C.panel, 9)
+    tween(edge, 0, {BackgroundTransparency = 1}); edge.ZIndex = 10
+    stroke(edge, C.stroke, 0)
+    -- Sink clicks on the panel itself instead of forwarding them to the overlay.
+    local panelHit = hit(panel, "PanelHit", 0, 0, width, height)
+    panelHit.ZIndex = 0
+    local record = {overlay = overlay, panel = panel, connections = {}, onClose = onClose}
+    popup.current = record; popup.anchor = anchor
+    local function listen(signal, callback)
+        local connection = signal:Connect(function(...)
+            if popup.current == record and not destroyed then callback(...) end
+        end)
+        table.insert(record.connections, connection)
+        return connection
+    end
+    local function close() if popup.current == record then closePopup() end end
+    listen(overlay.Activated, close)
+    listen(Input.InputBegan, function(input)
+        if input.KeyCode == Enum.KeyCode.Escape then close() end
+    end)
+    build(panel, listen, close)
+    tween(panel, 0.18, {Position = UDim2.fromOffset(x, y), FadeTransparency = 0})
+end
+
+local header = rect(root, "Header", 6, 6, 588, 44, C.panel, 12)
+stroke(header, C.stroke, 0.4)
+local sidebar = rect(root, "Sidebar", 6, 56, 52, 308, C.panel, 12)
+stroke(sidebar, C.stroke, 0.4)
+local content = rect(root, "Content", 62, 56, 532, 308, C.panel, 12)
+stroke(content, C.stroke, 0.4)
+content.ClipsDescendants = false
+-- Transparent input guard while page contents crossfade.
+local veil = hit(content, "PageInputShield", 0, 0, 532, 308)
+veil.ZIndex = 100
+veil.Visible = false
+asset(root, "Logo", windowOptions.logo, "target", 16, 11, 30, 34)
+local avatar = asset(root, "Avatar", windowOptions.avatar, "user", 18, 330, 28, 28)
+new("UICorner", avatar, {CornerRadius = UDim.new(1, 0)})
+
+local search = new("TextBox", header, {
+    Name = "Search", Position = UDim2.fromOffset(72, 8), Size = UDim2.fromOffset(220, 28),
+    BackgroundColor3 = C.row, BorderSizePixel = 0, ClearTextOnFocus = false,
+    Text = "", PlaceholderText = "search", PlaceholderColor3 = C.text,
+    TextColor3 = Color3.fromRGB(192,195,201), TextSize = 14, FontFace = face,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+new("UICorner", search, {CornerRadius = UDim.new(1, 0)})
+new("UIPadding", search, {PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 34)})
+local searchStroke = stroke(search, C.stroke, 0)
+connect(search.Focused, function() tween(searchStroke, 0.15, {Color = C.accent}) end)
+connect(search.FocusLost, function() tween(searchStroke, 0.15, {Color = C.stroke}) end)
+icon(header, "search", 268, 14, 16, C.text)
+
+local titleX = 330
+local tabTitle = label(header, "Title", "", titleX, 0, 232, 44, titleColor, 14)
+tabTitle.TextXAlignment = Enum.TextXAlignment.Right
+tabTitle.TextTruncate = Enum.TextTruncate.AtEnd
+useAccent(rect(header, "Dot", 570, 18, 8, 8, C.accent, "full"))
+local titleRequest, titleRevision = "", 0
+local function setTitle(text)
+    if titleRequest == text then return end
+    titleRequest = text
+    titleRevision = titleRevision + 1
+    local revision = titleRevision
+    if tabTitle.Text == "" then tabTitle.Text = text; return end
+    tween(tabTitle, 0.09, {Position = UDim2.fromOffset(titleX - 4, 0)})
+    afterTween(tween(tabTitle, 0.09, {TextTransparency = 1}), function()
+        if revision ~= titleRevision then return end
+        tabTitle.Text = text
+        tween(tabTitle, 0, {Position = UDim2.fromOffset(titleX + 4, 0)})
+        tween(tabTitle, 0.18, {TextTransparency = 0, Position = UDim2.fromOffset(titleX, 0)})
+    end)
+end
+
+----------------------------------------------------------------------
+-- pages
+----------------------------------------------------------------------
+local function newPage(title)
+    local frame = new("Frame", content, {
+        Name = title, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+        BorderSizePixel = 0, Visible = false, FadeTransparency = 1,
+    })
+    return {frame = frame, title = title, columns = {}}
+end
+local function newColumn(page, x, title)
+    local col = new("ScrollingFrame", page.frame, {
+        Name = "Column", BackgroundTransparency = 1, BorderSizePixel = 0, Active = true,
+        Position = UDim2.fromOffset(x - 6, 12), Size = UDim2.fromOffset(254, 284),
+        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 2,
+        ScrollBarImageColor3 = C.accent, ScrollBarImageTransparency = 0.45,
+    })
+    useAccent(col, "ScrollBarImageColor3")
+    new("UIPadding", col, {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 7), PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 8)})
+    connect(col.MouseEnter, function() tween(col, 0.16, {ScrollBarImageTransparency = 0.05}) end)
+    connect(col.MouseLeave, function() tween(col, 0.16, {ScrollBarImageTransparency = 0.45}) end)
+    col:SetAttribute("x", x)
+    new("UIListLayout", col, {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder})
+    if title and title ~= "" then section(col, title) end
+    table.insert(page.columns, col)
+    return col
+end
+local function add(col, key)
+    local d = byKey[key]
+    return controls[d.kind](col, d)
+end
+
+local keyHint
+local pages = {}
+local settingsPage
+local elementColumns = {}
+do -- 5 Settings
+    local p = newPage("Settings")
+    local left = newColumn(p, 16, "Interface")
+    add(left, "uiScale"); add(left, "accent"); keyHint = info(left, "menu key", "RShift")
+    local right = newColumn(p, 274, "Actions")
+    button(right, "reset all", function()
+        for _, d in ipairs(defs) do if not d.transient then api:Set(d.key, d.value) end end
+    end)
+    button(right, "hide menu", function() api:SetOpen(false) end)
+    button(right, "unload", function() api:Destroy() end)
+    settingsPage = p
+    p.isSettings = true; p.icon = "settings"
+    pages[1] = p
+    elementColumns = p.columns
+end
+
+do -- Configs are part of Settings
+    local p = settingsPage
+    local left = p.columns[1]
+    section(left, "Session profiles")
+    add(left, "configName"); add(left, "configProfile")
+    local function run(action, success)
+        local ok, result, message = pcall(action)
+        api:Set("configStatus", not ok and tostring(result) or result == false and tostring(message) or success)
+    end
+    button(left, "save profile", function() run(function() return api:SaveConfig(api:Get("configName")) end, "Profile saved for this session") end)
+    button(left, "load profile", function() run(function() return api:LoadConfig(api:Get("configProfile")) end, "Profile loaded") end)
+    button(left, "delete profile", function() run(function() return api:DeleteConfig(api:Get("configProfile")) end, "Profile deleted") end)
+    local right = p.columns[2]
+    section(right, "Import / export")
+    add(right, "configStatus"); add(right, "configJson")
+    button(right, "export JSON", function()
+        run(function() api:Set("configJson", api:ExportConfig()); return true end, "JSON ready. Select the text and copy it to keep your config.")
+    end)
+    button(right, "import JSON", function()
+        run(function() return api:ImportConfig(api:Get("configJson")) end, "JSON imported")
+    end)
+end
+
+-- search results page (every setting, filtered by name)
+local searchPage = newPage("Search")
+local scroll = new("ScrollingFrame", searchPage.frame, {
+    Name = "Results", BackgroundTransparency = 1, BorderSizePixel = 0,
+    Position = UDim2.fromOffset(12, 12), Size = UDim2.fromOffset(512, 284),
+    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.None,
+    ScrollBarThickness = 3, ScrollBarImageColor3 = C.accent,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+})
+useAccent(scroll, "ScrollBarImageColor3")
+tween(scroll, 0, {ScrollBarImageTransparency = 0.45})
+connect(scroll.MouseEnter, function() tween(scroll, 0.16, {ScrollBarImageTransparency = 0.05}) end)
+connect(scroll.MouseLeave, function() tween(scroll, 0.16, {ScrollBarImageTransparency = 0.45}) end)
+scroll:SetAttribute("x", 16)
+table.insert(searchPage.columns, scroll)
+section(scroll, "Search", 508)
+local resultItems = {}
+local function registerSearchItem(d)
+    if d.searchable == false then return end
+    local item = new("Frame", scroll, {
+        Name = "Result_" .. d.key, BackgroundTransparency = 1,
+        BorderSizePixel = 0, Visible = false, FadeTransparency = 1,
+        Size = UDim2.fromOffset(244, 64),
+    })
+    local control = controls[d.kind](item, d)
+    control.Position = UDim2.fromOffset(1, 1)
+    item.Size = UDim2.fromOffset(244, control.Size.Y.Offset + 2)
+    new("UIScale", item, {Scale = 1})
+    resultItems[d.key] = item
+end
+for _, d in ipairs(defs) do registerSearchItem(d) end
+local empty = label(scroll, "Empty", "nothing found", 0, 28, 508, 24, C.text, 13)
+tween(empty, 0, {TextTransparency = 1})
+empty.Visible = false
+
+----------------------------------------------------------------------
+-- page transitions
+----------------------------------------------------------------------
+local current, selectedPage
+local transitionId = 0
+local function showPage(page, dir)
+    if page == current then return end
+    closePopup()
+    transitionId = transitionId + 1
+    local revision = transitionId
+    local first = current == nil
+    current = page
+    setTitle(windowOptions.title and (windowOptions.title .. " / " .. page.title) or page.title)
+    local all = {searchPage}
+    for _, p in ipairs(pages) do table.insert(all, p) end
+    for _, p in ipairs(all) do
+        if p ~= page and p.frame.Visible then
+            local outgoing = p
+            tween(outgoing.frame, 0.18, {Position = UDim2.fromOffset(-dir * 8, 0)})
+            afterTween(tween(outgoing.frame, 0.18, {FadeTransparency = 1}), function()
+                if outgoing ~= current then outgoing.frame.Visible = false end
+            end)
+        end
+    end
+    if first then
+        page.frame.Visible = true
+        tween(page.frame, 0, {FadeTransparency = 0, Position = UDim2.fromOffset(0, 0)})
+        return
+    end
+    if not page.frame.Visible then
+        tween(page.frame, 0, {FadeTransparency = 1, Position = UDim2.fromOffset(dir * 8, 0)})
+    end
+    page.frame.Visible = true
+    veil.Visible = true
+    tween(page.frame, 0.24, {Position = UDim2.fromOffset(0, 0)})
+    afterTween(tween(page.frame, 0.24, {FadeTransparency = 0}), function()
+        if revision == transitionId then renderTree(page.frame); veil.Visible = false end
+    end)
+end
+local filterRevision = 0
+local function showDesired(dir)
+    local query = string.lower(search.Text)
+    local active = #query >= 2
+    if active then
+        filterRevision = filterRevision + 1
+        local revision = filterRevision
+        local count, y, rowHeight = 0, 28, 0
+        for _, d in ipairs(defs) do
+            local item = resultItems[d.key]
+            if item then
+            local matched = string.find(string.lower(d.text), query, 1, true) ~= nil
+            item:SetAttribute("Matched", matched)
+            if matched then
+                local column = count % 2
+                if column == 0 and count > 0 then y = y + rowHeight + 8; rowHeight = 0 end
+                local target = UDim2.fromOffset(column * 250 + 1, y)
+                local sc = item:FindFirstChildOfClass("UIScale")
+                if not item.Visible then
+                    tween(item, 0, {Position = target, FadeTransparency = 1})
+                    tween(sc, 0, {Scale = 0.98})
+                    item.Visible = true
+                end
+                tween(item, 0.20, {Position = target, FadeTransparency = 0})
+                tween(sc, 0.20, {Scale = 1})
+                rowHeight = math.max(rowHeight, item.Size.Y.Offset)
+                count = count + 1
+            elseif item.Visible then
+                local outgoing = item
+                afterTween(tween(outgoing, 0.12, {FadeTransparency = 1}), function()
+                    if not outgoing:GetAttribute("Matched") then outgoing.Visible = false end
+                end)
+            end
+            end
+        end
+        local noResults = count == 0
+        if noResults then empty.Visible = true end
+        afterTween(tween(empty, 0.16, {TextTransparency = noResults and 0 or 1}), function()
+            if revision == filterRevision then empty.Visible = noResults end
+        end)
+        tween(scroll, 0.18, {CanvasSize = UDim2.fromOffset(0, count > 0 and y + rowHeight + 4 or 56), CanvasPosition = Vector2.zero})
+    end
+    showPage(active and searchPage or pages[api.Tab + 1], dir)
+end
+connect(search:GetPropertyChangedSignal("Text"), function()
+    if search:GetAttribute("SelectingTab") then return end
+    showDesired(#search.Text >= 2 and 1 or -1)
+end)
+
+----------------------------------------------------------------------
+-- sidebar tabs with a sliding indicator
+----------------------------------------------------------------------
+local navigation = new("ScrollingFrame", root, {
+    Name = "TabList", Position = UDim2.fromOffset(6, 60), Size = UDim2.fromOffset(50, 224),
+    BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(),
+    ScrollBarThickness = 1, ScrollBarImageTransparency = 0.7, ScrollBarImageColor3 = C.accent,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+})
+local marker = useAccent(rect(root, "ActiveTab", 7, 299, 3, 16, C.accent, "full"))
+local tabs = {}
+local function styleTab(i, selected, animated)
+    local tab = tabs[i]
+    if not tab then return end
+    local t = animated and 0.2 or 0
+    tween(tab.image, t, {ImageColor3 = selected and C.accent or tab.hovered and titleColor or C.inactive})
+    tween(tab.tile, t, {BackgroundColor3 = selected and C.bg or tab.hovered and C.rowHover or C.panel})
+end
+local function moveMarker(index, animated)
+    local page = pages[index + 1]
+    local host = page.isSettings and root or navigation
+    local position = page.isSettings and UDim2.fromOffset(7, 299) or UDim2.fromOffset(1, 11 + index * 38)
+    if marker.Parent ~= host then marker.Parent = host; marker.Position = position end
+    tween(marker, animated and 0.26 or 0, {Position = position})
+    if not page.isSettings then
+        local y = 4 + index * 38
+        local top = navigation.CanvasPosition.Y
+        if y < top then navigation.CanvasPosition = Vector2.new(0, y)
+        elseif y + 30 > top + 224 then navigation.CanvasPosition = Vector2.new(0, y + 30 - 224) end
+    end
+end
+local function rebuildTabs()
+    table.clear(tabs)
+    api.Tabs = {}
+    for index, page in ipairs(pages) do
+        if not page.tab then
+            local tile = rect(page.isSettings and root or navigation, "Tab_" .. page.title, 0, 0, 30, 30, C.panel, 10)
+            local image = icons[page.icon or "target"] and icon(tile, page.icon or "target", 5, 5, 20, C.inactive)
+                or asset(tile, "CustomIcon", page.icon, "target", 5, 5, 20, 20)
+            page.tab = {tile = tile, image = image}
+            local select = hit(tile, "Select", 0, 0, 30, 30)
+            connect(select.Activated, function() api:SelectTab(table.find(pages, page) - 1) end)
+            connect(select.MouseEnter, function()
+                page.tab.hovered = true
+                local i = table.find(pages, page); styleTab(i, api.Tab == i - 1, true)
+            end)
+            connect(select.MouseLeave, function()
+                page.tab.hovered = false
+                local i = table.find(pages, page); styleTab(i, api.Tab == i - 1, true)
+            end)
+        end
+        page.tab.tile.Position = page.isSettings and UDim2.fromOffset(17, 292) or UDim2.fromOffset(11, 4 + (index - 1) * 38)
+        tabs[index] = page.tab
+        api.Tabs[page.title] = index - 1
+    end
+    navigation.CanvasSize = UDim2.fromOffset(0, math.max(224, (#pages - 1) * 38 + 8))
+    api.Tab = selectedPage and (table.find(pages, selectedPage) or 1) - 1 or 0
+    for i = 1, #tabs do styleTab(i, i - 1 == api.Tab, false) end
+    moveMarker(api.Tab, false)
+end
+table.insert(refreshers, function()
+    for i = 1, #tabs do styleTab(i, i - 1 == api.Tab, true) end
+end)
+
+----------------------------------------------------------------------
+-- api
+----------------------------------------------------------------------
+hooks.accent = function(i)
+    if byKey.customAccent then api:Set("customAccent", ACCENTS[i]) end
+    setAccent(ACCENTS[i])
+end
+hooks.uiScale = function(v) tween(userScale, 0.24, {Value = v / 100}) end
+
+local function normalizeValue(d, value)
+    if d.kind == "color" then
+        assert(typeof(value) == "Color3", "Expected Color3 for: " .. d.key)
+        return value
+    end
+    assert(type(value) == type(d.value), "Wrong value type for: " .. d.key)
+    if d.kind == "slider" then
+        assert(value == value and math.abs(value) < math.huge, "Setting must be finite")
+        return math.clamp(math.floor((value - d.min) / d.step + 0.5) * d.step + d.min, d.min, d.max)
+    elseif d.kind == "select" or d.kind == "dropdown" then
+        assert(table.find(d.options, value) or (#d.options == 0 and value == ""), "Unknown option for: " .. d.key)
+    elseif d.kind == "multidropdown" then
+        local chosen, total = {}, 0
+        for index, option in pairs(value) do
+            assert(type(index) == "number" and index % 1 == 0 and index > 0, "Expected an array for: " .. d.key)
+            assert(type(option) == "string" and table.find(d.options, option), "Unknown selection for: " .. d.key)
+            assert(not chosen[option], "Duplicate selection for: " .. d.key)
+            chosen[option] = true; total = total + 1
+        end
+        for i = 1, total do assert(value[i] ~= nil, "Expected a dense array for: " .. d.key) end
+        local normalized = {}
+        for _, option in ipairs(d.options) do if chosen[option] then normalized[#normalized + 1] = option end end
+        return normalized
+    elseif d.kind == "swatch" then
+        assert(value % 1 == 0 and d.colors[value], "Unknown color index")
+    elseif d.kind == "input" or d.kind == "label" then
+        assert(utf8.len(value), "Text must be valid UTF-8")
+        assert(#value <= (d.maxLength or 1024), "Text is too long for: " .. d.key)
+    end
+    return value
+end
+function api:Set(key, value)
+    if destroyed or unloading then return end
+    local d = assert(byKey[key], "Unknown setting: " .. tostring(key))
+    value = normalizeValue(d, value)
+    if sameValue(self.State[key], value) then return end
+    self.State[key] = copyValue(value)
+    for _, fn in ipairs(syncs[key]) do fn(true) end
+    if hooks[key] then hooks[key](copyValue(value)) end
+    changed:Fire(key, copyValue(value))
+end
+function api:Get(key)
+    assert(byKey[key], "Unknown setting: " .. tostring(key))
+    return copyValue(self.State[key])
+end
+function api:SetOptions(key, options)
+    if destroyed or unloading then return end
+    assert(type(options) == "table", "Options must be an array")
+    local d = assert(byKey[key], "Unknown setting: " .. tostring(key))
+    assert(d.kind == "dropdown" or d.kind == "multidropdown", "Only dropdown controls support SetOptions")
+    local checked, used = {}, {}
+    local count = 0
+    for index in pairs(options) do
+        assert(type(index) == "number" and index > 0 and index % 1 == 0, "Options must be a dense array")
+        count = count + 1
+    end
+    assert(count <= 100, "Use at most 100 options")
+    for i = 1, count do assert(options[i] ~= nil, "Options must be a dense array") end
+    for _, option in ipairs(options) do
+        assert(type(option) == "string" and not used[option], "Options must be unique strings")
+        used[option] = true; checked[#checked + 1] = option
+    end
+    closePopup()
+    d.options = checked
+    if d.kind == "multidropdown" then
+        local defaults = {}
+        for _, option in ipairs(d.value) do if used[option] then defaults[#defaults + 1] = option end end
+        d.value = defaults
+    elseif not used[d.value] then
+        d.value = checked[1] or ""
+    end
+    local value = self:Get(key)
+    if d.kind == "multidropdown" then
+        local kept = {}
+        for _, option in ipairs(value) do if used[option] then kept[#kept + 1] = option end end
+        self:Set(key, kept)
+    else
+        self:Set(key, used[value] and value or checked[1] or "")
+    end
+    for _, sync in ipairs(syncs[key]) do sync(true) end
+end
+function api:ExportConfig()
+    local values = {}
+    for _, d in ipairs(defs) do
+        if not d.transient then
+            local value = self:Get(d.key)
+            values[d.key] = d.kind == "color" and {type = "Color3", hex = value:ToHex()} or value
+        end
+    end
+    return HttpService:JSONEncode({format = "SourceMenu", version = 1, values = values})
+end
+function api:ImportConfig(json)
+    if destroyed or unloading then return false, "Menu is unavailable" end
+    local ok, result = pcall(function()
+        assert(type(json) == "string" and #json <= 131072, "Config exceeds 128 KiB")
+        local data = HttpService:JSONDecode(json)
+        assert(type(data) == "table" and data.format == "SourceMenu" and data.version == 1, "Unsupported config format")
+        assert(type(data.values) == "table", "Missing config values")
+        local pending = {}
+        for key, value in pairs(data.values) do
+            local d = assert(byKey[key], "Unknown setting: " .. tostring(key))
+            assert(not d.transient, "Config contains a transient control: " .. key)
+            if d.kind == "color" then
+                assert(type(value) == "table" and value.type == "Color3" and type(value.hex) == "string"
+                    and value.hex:match("^%x%x%x%x%x%x$"), "Invalid color for: " .. key)
+                value = Color3.fromHex(value.hex)
+            end
+            pending[key] = normalizeValue(d, value)
+        end
+        -- Reject malformed input before any setting is applied.
+        for _, d in ipairs(defs) do if pending[d.key] ~= nil then self:Set(d.key, pending[d.key]) end end
+    end)
+    return ok, ok and "Config loaded" or tostring(result)
+end
+local sessionConfigs = {}
+local function configName(name)
+    assert(type(name) == "string", "Config name must be text")
+    name = name:match("^%s*(.-)%s*$")
+    assert(utf8.len(name) and #name > 0 and #name <= 64 and not name:find("[%z\1-\31]"), "Use a name of 1–64 bytes without control characters")
+    return name
+end
+function api:ListConfigs()
+    local names = {}
+    for name in pairs(sessionConfigs) do names[#names + 1] = name end
+    table.sort(names)
+    return names
+end
+function api:SaveConfig(name)
+    assert(not destroyed and not unloading, "Menu is unavailable")
+    name = configName(name)
+    assert(sessionConfigs[name] or #self:ListConfigs() < 32, "A session can contain up to 32 configs")
+    sessionConfigs[name] = self:ExportConfig()
+    self:SetOptions("configProfile", self:ListConfigs())
+    self:Set("configProfile", name)
+    return true
+end
+function api:LoadConfig(name)
+    local json = sessionConfigs[configName(name)]
+    if not json then return false, "Config not found" end
+    return self:ImportConfig(json)
+end
+function api:DeleteConfig(name)
+    if destroyed or unloading then return false, "Menu is unavailable" end
+    name = configName(name)
+    if not sessionConfigs[name] then return false, "Config not found" end
+    sessionConfigs[name] = nil
+    self:SetOptions("configProfile", self:ListConfigs())
+    return true
+end
+
+-- Reusable element API. All controls also appear in search unless opted out.
+function api:AddControl(kind, options, column, host)
+    assert(not destroyed and not unloading, "Menu is unavailable")
+    assert(type(options) == "table" and controls[kind], "Unknown control kind")
+    column = column or 1
+    assert(column == 1 or column == 2, "Column must be 1 or 2")
+    local d = copyValue(options)
+    d.kind = kind
+    d.key = d.key or ("custom_" .. kind .. "_" .. (#defs + 1))
+    d.text = d.text or kind
+    if kind == "dropdown" or kind == "multidropdown" or kind == "select" then
+        d.options = d.options or {}
+        assert(type(d.options) == "table", "Options must be an array")
+        local used, count = {}, 0
+        for index in pairs(d.options) do
+            assert(type(index) == "number" and index > 0 and index % 1 == 0, "Options must be a dense array")
+            count = count + 1
+        end
+        for i = 1, count do assert(d.options[i] ~= nil, "Options must be a dense array") end
+        for index, option in ipairs(d.options) do
+            assert(type(option) == "string" and not used[option], "Options must be unique strings")
+            used[option] = true
+            assert(index <= 100, "Use at most 100 options")
+        end
+        assert(kind ~= "select" or #d.options > 0, "Select requires options")
+        if d.value == nil then d.value = kind == "multidropdown" and {} or d.options[1] or "" end
+    elseif kind == "color" then
+        d.value = d.value or C.accent
+    elseif kind == "input" then
+        d.value = d.value or ""
+        d.maxLength = d.maxLength or 1024
+        assert(type(d.maxLength) == "number" and d.maxLength > 0 and d.maxLength <= 131072, "Invalid input length limit")
+    elseif kind == "label" then
+        d.value = d.value or d.text
+        d.transient = true
+    elseif kind == "button" then
+        d.value = 0; d.transient = true
+    elseif kind == "toggle" then
+        if d.value == nil then d.value = false end
+        assert(type(d.value) == "boolean", "Toggle value must be boolean")
+    elseif kind == "slider" then
+        assert(type(d.min) == "number" and type(d.max) == "number" and d.max > d.min, "Slider needs min < max")
+        d.step = d.step or 1
+        assert(type(d.step) == "number" and d.step > 0, "Slider step must be positive")
+        d.value = d.value or d.min
+    elseif kind == "swatch" then
+        assert(type(d.colors) == "table" and #d.colors > 0, "Swatch requires colors")
+        d.value = d.value or 1
+    end
+    if d.height then assert(type(d.height) == "number" and d.height >= 48 and d.height <= 240, "Height must be 48..240") end
+    assert(d.callback == nil or type(d.callback) == "function", "Callback must be a function")
+    d.value = normalizeValue(d, d.value)
+    def(d)
+    if d.callback and kind ~= "button" then hooks[d.key] = function(value) d.callback(value, api) end end
+    local targetColumn = options.tab == "settings" and settingsPage.columns[column] or elementColumns[column]
+    local frame = controls[kind](host or targetColumn, d)
+    registerSearchItem(d)
+    if #search.Text >= 2 then showDesired(1) end
+    local handle = {Frame = frame, Key = d.key}
+    function handle:Get() return api:Get(d.key) end
+    function handle:Set(value) api:Set(d.key, value); return self end
+    function handle:SetText(value)
+        assert(kind == "label" or kind == "input", "SetText requires a label or input")
+        return self:Set(value)
+    end
+    function handle:SetOptions(value) api:SetOptions(d.key, value); return self end
+    function handle:OnChanged(callback)
+        assert(type(callback) == "function", "OnChanged requires a callback")
+        return connect(api.Changed, function(key, value) if key == d.key then callback(copyValue(value)) end end)
+    end
+    local attachedColor, settingsPanel
+    local function arrangeAccessories()
+        local caption = frame:FindFirstChild("Label")
+        if not caption then return end
+        if kind == "toggle" then
+            local left = attachedColor and attachedColor.Side == "left" and 46 or 14
+            local right = settingsPanel and 162 or 186
+            if attachedColor and attachedColor.Side == "right" then right = 132 end
+            caption.Position = UDim2.fromOffset(left, 0)
+            caption.Size = UDim2.fromOffset(right - left, 38)
+        else
+            caption.Size = UDim2.fromOffset(kind == "slider" and 100 or 180, caption.Size.Y.Offset)
+            if kind == "slider" then
+                local number = frame:FindFirstChild("Value")
+                if number then number.Size = UDim2.fromOffset(78, number.Size.Y.Offset) end
+            end
+        end
+        caption.TextTruncate = Enum.TextTruncate.AtEnd
+    end
+    function handle:AddColorPicker(options, side)
+        assert(kind == "toggle", "Inline color requires a toggle")
+        assert(not attachedColor, "This toggle already has a color picker")
+        side = side or "left"
+        assert(side == "left" or side == "right", "Color side must be left or right")
+        local config = copyValue(options or {})
+        config.key = config.key or d.key .. "_color"
+        config.text = config.text or d.text .. " color"
+        config.inline = true; config.searchable = false
+        attachedColor = api:AddControl("color", config, 1, frame)
+        attachedColor.Side = side
+        attachedColor.Frame.Position = UDim2.fromOffset(side == "left" and 14 or 136, 7)
+        attachedColor.Frame.ZIndex = 5
+        arrangeAccessories()
+        return attachedColor
+    end
+    function handle:AddSettings(options)
+        assert(not settingsPanel, "This control already has mini settings")
+        settingsPanel = api:CreateMiniSettings(frame, options or {title = d.text})
+        local gear = hit(frame, "MiniSettings", kind == "toggle" and 164 or 206, 7, 24, 24)
+        gear.ZIndex = 6
+        local glyph = icon(gear, "settings", 4, 4, 16, C.inactive)
+        connect(gear.MouseEnter, function() tween(glyph, 0.16, {ImageColor3 = C.accent, Rotation = 30}) end)
+        connect(gear.MouseLeave, function() tween(glyph, 0.16, {ImageColor3 = C.inactive, Rotation = 0}) end)
+        connect(gear.Activated, function() settingsPanel:Toggle() end)
+        arrangeAccessories()
+        return settingsPanel
+    end
+    if options.color then handle.Color = handle:AddColorPicker(options.color, options.colorSide) end
+    if options.settings then
+        handle.Settings = handle:AddSettings({title = options.settingsTitle or d.text})
+        for _, control in ipairs(options.settings) do handle.Settings:AddControl(control.kind, control) end
+    end
+    function handle:SetVisible(value) frame.Visible = value == true; return self end
+    return handle
+end
+function api:AddDropdown(d, column) return self:AddControl("dropdown", d, column) end
+function api:AddMultiDropdown(d, column) return self:AddControl("multidropdown", d, column) end
+function api:AddInput(d, column) return self:AddControl("input", d, column) end
+function api:AddButton(d, column) return self:AddControl("button", d, column) end
+function api:AddColorPicker(d, column) return self:AddControl("color", d, column) end
+function api:AddLabel(d, column) return self:AddControl("label", d, column) end
+function api:AddToggle(d, column) return self:AddControl("toggle", d, column) end
+function api:AddSlider(d, column) return self:AddControl("slider", d, column) end
+
+-- Persistent mini panels keep control subscriptions and values across openings.
+local activeMini
+closeMini = function(immediate)
+    local current = activeMini
+    if not current then return end
+    activeMini = nil
+    current.revision = current.revision + 1
+    local revision = current.revision
+    closePopup(immediate)
+    activePicker = nil
+    if activeSlider then tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)}); activeSlider = nil end
+    if immediate then
+        tween(current.frame, 0, {FadeTransparency = 1})
+        current.overlay.Visible = false
+    else
+        afterTween(tween(current.frame, 0.16, {FadeTransparency = 1}), function()
+            if current.revision == revision then current.overlay.Visible = false end
+        end)
+    end
+end
+function api:CreateMiniSettings(anchor, options)
+    assert(not destroyed and not unloading, "Menu is unavailable")
+    options = options or {}
+    assert(anchor and anchor:IsA("GuiObject"), "Mini settings need a control anchor")
+    local height = options.height or 224
+    assert(type(height) == "number" and height >= 160 and height <= 288, "Mini height must be 160..288")
+    local overlay = hit(root, "MiniOverlay", 0, 0, 600, 370)
+    overlay.ZIndex = 110; overlay.Visible = false
+    local panel = new("Frame", overlay, {
+        Name = "MiniSettingsPanel", Size = UDim2.fromOffset(254, height),
+        BackgroundColor3 = C.panel, BorderSizePixel = 0, FadeTransparency = 1, ZIndex = 2,
+    })
+    new("UICorner", panel, {CornerRadius = UDim.new(0, 12)})
+    local edge = rect(panel, "MiniBorder", 1, 1, 252, height - 2, C.panel, 11)
+    tween(edge, 0, {BackgroundTransparency = 1}); edge.ZIndex = 20
+    stroke(edge, C.stroke, 0)
+    local sink = hit(panel, "PanelHit", 0, 0, 254, height); sink.ZIndex = 0
+    local caption = label(panel, "Title", options.title or "Settings", 12, 6, 196, 26, titleColor, 13)
+    caption.TextTruncate = Enum.TextTruncate.AtEnd
+    local dismiss = hit(panel, "CloseMini", 220, 6, 24, 24)
+    dismiss.Text = "×"; dismiss.TextSize = 20; dismiss.TextColor3 = titleColor; dismiss.FontFace = face
+    local body = new("ScrollingFrame", panel, {
+        Name = "MiniControls", Position = UDim2.fromOffset(0, 38), Size = UDim2.fromOffset(254, height - 46),
+        BackgroundTransparency = 1, BorderSizePixel = 0, Active = true,
+        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 2, ScrollBarImageColor3 = C.accent, ScrollBarImageTransparency = 0.45,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+    })
+    useAccent(body, "ScrollBarImageColor3")
+    new("UIPadding", body, {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 7), PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 8)})
+    new("UIListLayout", body, {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder})
+    local record = {frame = panel, overlay = overlay, revision = 0}
+    local mini = {Frame = panel, Container = body}
+    function mini:IsOpen() return activeMini == record end
+    function mini:Open()
+        if destroyed or unloading or not api.Open or not anchor.Parent then return self end
+        closeMini(true); closePopup(true)
+        record.revision = record.revision + 1
+        activeMini = record
+        local factor = math.max(0.01, root.AbsoluteSize.X / 600)
+        local relative = (anchor.AbsolutePosition - root.AbsolutePosition) / factor
+        local x = math.clamp(relative.X + anchor.AbsoluteSize.X / factor + 8, 8, 338)
+        local y = math.clamp(relative.Y, 8, 370 - height - 8)
+        overlay.Visible = true
+        tween(panel, 0, {Position = UDim2.fromOffset(x, y + 4), FadeTransparency = 1})
+        tween(panel, 0.20, {Position = UDim2.fromOffset(x, y), FadeTransparency = 0})
+        return self
+    end
+    function mini:Close() if activeMini == record then closeMini() end; return self end
+    function mini:Toggle() if self:IsOpen() then return self:Close() else return self:Open() end end
+    function mini:SetTitle(value) caption.Text = tostring(value); return self end
+    function mini:AddControl(kind, options)
+        local config = copyValue(options or {})
+        if config.searchable == nil then config.searchable = false end
+        return api:AddControl(kind, config, 1, body)
+    end
+    function mini:AddSection(text) section(body, tostring(text)); return self end
+    local kinds = {Toggle="toggle", Slider="slider", Dropdown="dropdown", MultiDropdown="multidropdown",
+        Input="input", Button="button", ColorPicker="color", Label="label", Select="select", Swatch="swatch"}
+    for name, kind in pairs(kinds) do
+        mini["Add" .. name] = function(self, config) return self:AddControl(kind, config) end
+    end
+    connect(overlay.Activated, function() mini:Close() end)
+    connect(dismiss.Activated, function() mini:Close() end)
+    connect(dismiss.MouseEnter, function() tween(dismiss, 0.16, {TextColor3 = C.accent}) end)
+    connect(dismiss.MouseLeave, function() tween(dismiss, 0.16, {TextColor3 = titleColor}) end)
+    connect(body.MouseEnter, function() tween(body, 0.16, {ScrollBarImageTransparency = 0.05}) end)
+    connect(body.MouseLeave, function() tween(body, 0.16, {ScrollBarImageTransparency = 0.45}) end)
+    return mini
+end
+connect(Input.InputBegan, function(input)
+    if input.KeyCode == Enum.KeyCode.Escape and not popup.current then closeMini() end
+end)
+function api:SetMotionSpeed(value)
+    assert(type(value) == "number" and value >= 0.25 and value <= 3, "Motion speed must be 0.25..3")
+    motionSpeed = value
+    return self
+end
+function api:SetKeybind(key)
+    assert(typeof(key) == "EnumItem" and key.EnumType == Enum.KeyCode, "Use Enum.KeyCode")
+    menuKey = key
+    if keyHint then keyHint:FindFirstChild("Value", true).Text = key.Name end
+    return self
+end
+function api:SetTheme(theme)
+    assert(type(theme) == "table", "Theme must be a table")
+    for name, color in pairs(theme) do assert(C[name] ~= nil and typeof(color) == "Color3", "Unknown theme token or invalid color: " .. tostring(name)) end
+    for name, color in pairs(theme) do C[name] = color end
+    labelColor, titleColor = C.label, C.title
+    for item, bindings in pairs(themeBindings) do
+        if item.Parent then
+            local props = {}
+            for property, token in pairs(bindings) do if theme[token] then props[property] = theme[token] end end
+            if next(props) then tween(item, 0.22, props) end
+        end
+    end
+    if theme.accent then setAccent(theme.accent) end
+    return self
+end
+function api:GetTheme() return copyValue(C) end
+function api:GetIconCacheInfo()
+    local loaded = 0
+    for _, state in pairs(iconCache.assets) do if state == true then loaded = loaded + 1 end end
+    return {catalogCached = iconCache.fetched, loadedAtlases = loaded, source = ICON_URL}
+end
+
+-- Tabs and sections share the same element builder as embedded mini panels.
+local function makeBuilder(columns, group)
+    local builder = {Container = group}
+    function builder:AddControl(kind, options, side)
+        local column = side == "right" and 2 or side == "left" and 1 or side or 1
+        assert(column == 1 or column == 2, "Side must be left/right or 1/2")
+        return api:AddControl(kind, options or {}, column, group or columns[column])
+    end
+    local kinds = {Toggle="toggle", Slider="slider", Dropdown="dropdown", MultiDropdown="multidropdown",
+        Input="input", Button="button", ColorPicker="color", Label="label", Select="select", Swatch="swatch"}
+    for name, kind in pairs(kinds) do
+        builder["Add" .. name] = function(self, options, side) return self:AddControl(kind, options, side) end
+    end
+    function builder:AddSection(options, side)
+        assert(not destroyed and not unloading, "Window is unavailable")
+        if type(options) == "string" then options = {name = options} end
+        options = options or {}
+        side = options.side or side or "left"
+        local column = side == "right" and 2 or side == "left" and 1 or side
+        assert(column == 1 or column == 2, "Side must be left/right or 1/2")
+        local parent = group or columns[column]
+        local container = new("Frame", parent, {
+            Name = "Section_" .. (options.name or "Section"), BackgroundTransparency = 1,
+            Size = UDim2.fromOffset(242, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BorderSizePixel = 0, LayoutOrder = ord(parent),
+        })
+        new("UIListLayout", container, {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder})
+        local heading = section(container, options.name or "Section")
+        local result = makeBuilder(columns, container)
+        result.Frame = container
+        function result:SetTitle(value) heading:FindFirstChild("Title").Text = tostring(value); return self end
+        function result:SetVisible(value) container.Visible = value == true; return self end
+        return result
+    end
+    return builder
+end
+function api:CreateTab(options)
+    assert(not destroyed and not unloading, "Window is unavailable")
+    if type(options) == "string" then options = {name = options} end
+    options = options or {}
+    local name = options.name or ("Tab " .. #pages)
+    assert(type(name) == "string" and #name > 0 and #name <= 64, "Tab name must be 1..64 bytes")
+    for _, page in ipairs(pages) do assert(page.title ~= name, "Tab names must be unique") end
+    local glyph = options.icon or "target"
+    assert(type(glyph) == "string", "Tab icon must be an icon name or asset URI")
+    assert(icons[glyph] or glyph:match("^rbxassetid://%d+$"), "Unknown tab icon")
+    local page = newPage(name)
+    page.icon = glyph
+    newColumn(page, 16); newColumn(page, 274)
+    table.insert(pages, #pages, page)
+    if #pages == 2 then elementColumns = page.columns end
+    rebuildTabs()
+    local tab = makeBuilder(page.columns)
+    tab.Frame = page.frame
+    tab.Name = name
+    function tab:Select() api:SelectTab(table.find(pages, page) - 1); return self end
+    function tab:GetIndex() return table.find(pages, page) - 1 end
+    if #pages == 2 then tab:Select() end
+    return tab
+end
+function api:GetSettingsTab()
+    if not settingsPage.builder then
+        settingsPage.builder = makeBuilder(settingsPage.columns)
+        settingsPage.builder.Frame = settingsPage.frame
+        function settingsPage.builder:Select() api:SelectTab(table.find(pages, settingsPage) - 1); return self end
+        function settingsPage.builder:GetIndex() return table.find(pages, settingsPage) - 1 end
+    end
+    return settingsPage.builder
+end
+
+function api:SelectTab(index)
+    if destroyed or unloading then return end
+    assert(type(index) == "number" and index % 1 == 0 and index >= 0 and index < #pages, "Tab index is out of range")
+    closePopup()
+    closeMini()
+    local previousTab = self.Tab
+    self.Tab = index
+    selectedPage = pages[index + 1]
+    for i = 1, #tabs do styleTab(i, i - 1 == index, true) end
+    moveMarker(index, true)
+    if search.Text ~= "" then
+        -- Suppress the intermediate page chosen by the Text change callback.
+        search:SetAttribute("SelectingTab", true)
+        search.Text = ""
+        search:SetAttribute("SelectingTab", false)
+    end
+    showDesired(index >= previousTab and 1 or -1)
+end
+
+-- window dragging (header) and slider dragging
+local dragging, dragStart, startPosition, touchInput
+connect(header.InputBegan, function(input)
+    if not api.Open or winVeil.Visible then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        local sx, sw = search.AbsolutePosition.X, search.AbsoluteSize.X
+        if input.Position.X >= sx and input.Position.X <= sx + sw then return end
+        positionFollowers[root] = nil
+        dragging = true; dragStart = input.Position; startPosition = root.Position
+        touchInput = input.UserInputType == Enum.UserInputType.Touch and input or nil
+    end
+end)
+header.Active = true
+connect(Input.InputChanged, function(input)
+    if activePicker and (input == activePicker.input or
+        (activePicker.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)) then
+        activePicker.update(input.Position)
+    end
+    if activeSlider and (input == activeSlider.input or
+        (activeSlider.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)) then
+        activeSlider.fromX(input.Position.X)
+    end
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= touchInput then return end
+    local delta = input.Position - dragStart
+    local size = gui.AbsoluteSize
+    local x = startPosition.X.Scale * size.X + startPosition.X.Offset + delta.X
+    local y = startPosition.Y.Scale * size.Y + startPosition.Y.Offset + delta.Y
+    local halfX = math.min(root.AbsoluteSize.X * 0.5 + 12, size.X * 0.5)
+    local halfY = math.min(root.AbsoluteSize.Y * 0.5 + 12, size.Y * 0.5)
+    homePos = UDim2.fromOffset(
+        math.clamp(x, halfX, math.max(halfX, size.X - halfX)),
+        math.clamp(y, halfY, math.max(halfY, size.Y - halfY)))
+    followPosition(root, homePos)
+end)
+connect(Input.InputEnded, function(input)
+    if activePicker and (input == activePicker.input or
+        (activePicker.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+        activePicker = nil
+    end
+    if activeSlider and (input == activeSlider.input or
+        (activeSlider.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+        tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)})
+        activeSlider = nil
+    end
+    if (not touchInput and input.UserInputType == Enum.UserInputType.MouseButton1) or input == touchInput then
+        dragging = false; touchInput = nil
+    end
+end)
+connect(Input.InputBegan, function(input, processed)
+    if not processed and not Input:GetFocusedTextBox() and input.KeyCode == menuKey then
+        api:SetOpen(not api.Open)
+    end
+end)
+
+-- floating draggable icon (no background): tap = open/close, drag = move
+local fab = asset(gui, "MenuButton", windowOptions.logo, "target", 24, 140, 36, 40)
+fab.ZIndex = 200
+local fabScale = new("UIScale", fab, {Scale = 1})
+local fabHit = hit(fab, "Hit", 0, 0, 36, 40)
+local fabDrag, fabStart, fabOrigin, fabInput, fabMoved = false, nil, nil, nil, false
+connect(fabHit.MouseEnter, function() if not fabDrag then tween(fabScale, 0.15, {Scale = 1.06}) end end)
+connect(fabHit.MouseLeave, function() if not fabDrag then tween(fabScale, 0.15, {Scale = 1}) end end)
+connect(fabHit.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        positionFollowers[fab] = nil
+        fabDrag = true; fabMoved = false
+        fabStart = input.Position; fabOrigin = fab.Position
+        fabInput = input.UserInputType == Enum.UserInputType.Touch and input or nil
+        tween(fabScale, 0.1, {Scale = 0.96})
+    end
+end)
+connect(Input.InputChanged, function(input)
+    if not fabDrag then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= fabInput then return end
+    local delta = input.Position - fabStart
+    if not fabMoved and delta.Magnitude < 5 then return end
+    fabMoved = true
+    local size = gui.AbsoluteSize
+    followPosition(fab, UDim2.fromOffset(
+        math.clamp(fabOrigin.X.Offset + delta.X, 0, math.max(0, size.X - 36)),
+        math.clamp(fabOrigin.Y.Offset + delta.Y, 0, math.max(0, size.Y - 40))
+    ))
+end)
+connect(Input.InputEnded, function(input)
+    if not fabDrag then return end
+    if (not fabInput and input.UserInputType == Enum.UserInputType.MouseButton1) or input == fabInput then
+        fabDrag = false; fabInput = nil
+        tween(fabScale, 0.15, {Scale = 1})
+        if not fabMoved then api:SetOpen(not api.Open) end
+    end
+end)
+
+-- Releasing focus may swallow InputEnded; never keep a drag latched.
+connect(Input.WindowFocusReleased, function()
+    closeMini()
+    closePopup()
+    activePicker = nil
+    dragging = false; touchInput = nil
+    fabDrag = false; fabInput = nil; fabMoved = false
+    tween(fabScale, 0.15, {Scale = 1})
+    if activeSlider then
+        tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)})
+        activeSlider = nil
+    end
+end)
+
+-- A small scale change and an even fade, both driven by one value.
+api.Open = false
+local openness = new("NumberValue", gui, {Name = "WindowOpacity", Value = 0})
+local openRevision = 0
+local function homePoint()
+    local size = gui.AbsoluteSize
+    local fullScale = scale.Scale / math.max(intro.Value, 0.001)
+    local halfX = math.min(300 * fullScale + 12, size.X * 0.5)
+    local halfY = math.min(185 * fullScale + 12, size.Y * 0.5)
+    return Vector2.new(
+        math.clamp(homePos.X.Scale * size.X + homePos.X.Offset, halfX, math.max(halfX, size.X - halfX)),
+        math.clamp(homePos.Y.Scale * size.Y + homePos.Y.Offset, halfY, math.max(halfY, size.Y - halfY)))
+end
+local function drawWindow()
+    local value = math.clamp(openness.Value, 0, 1)
+    intro.Value = 0.97 + 0.03 * value
+    fades[root].Value = 1 - value
+    root.Rotation = 0
+    local home = homePoint()
+    root.Position = UDim2.fromOffset(home.X, home.Y)
+end
+connect(openness.Changed, drawWindow)
+connect(userScale.Changed, drawWindow)
+connect(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
+    local size = gui.AbsoluteSize
+    closePopup(true)
+    closeMini(true)
+    positionFollowers[root] = nil
+    positionFollowers[fab] = nil
+    fab.Position = UDim2.fromOffset(
+        math.clamp(fab.Position.X.Offset, 0, math.max(0, size.X - fab.AbsoluteSize.X)),
+        math.clamp(fab.Position.Y.Offset, 0, math.max(0, size.Y - fab.AbsoluteSize.Y)))
+    drawWindow()
+end)
+function api:SetOpen(open)
+    if destroyed or unloading then return end
+    assert(type(open) == "boolean", "Open must be a boolean")
+    if self.Open == open then return end
+    closePopup()
+    closeMini()
+    self.Open = open
+    if positionFollowers[root] then homePos = root.Position; positionFollowers[root] = nil end
+    openRevision = openRevision + 1
+    local revision = openRevision
+    dragging = false; touchInput = nil
+    if activeSlider then
+        tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)})
+        activeSlider = nil
+    end
+    if not open then search:ReleaseFocus() end
+    winVeil.Visible = true
+    drawWindow()
+    root.Visible = true
+    local target = open and 1 or 0
+    local duration = math.max(0.06, (open and 0.24 or 0.18) * math.abs(target - openness.Value))
+    -- The helper cancels the previous tween before starting from its current value.
+    local animation = tween(openness, duration, {Value = target}, Enum.EasingStyle.Quad)
+    local finished
+    finished = animation.Completed:Connect(function(state)
+        finished:Disconnect()
+        if destroyed or revision ~= openRevision or state ~= Enum.PlaybackState.Completed then return end
+        root.Visible = self.Open
+        winVeil.Visible = false
+    end)
+end
+
+function api:Destroy()
+    if destroyed or unloading then return end
+    if not root.Visible then gui:Destroy(); return end
+    self:SetOpen(false)
+    unloading = true
+    local closing = activeTweens[openness] and activeTweens[openness].Value
+    if closing then
+        afterTween(closing, function() gui:Destroy() end)
+    else
+        gui:Destroy()
+    end
+end
+connect(gui.Destroying, function()
+    if destroyed then return end
+    destroyed = true
+    closeMini(true)
+    closePopup(true)
+    openRevision = openRevision + 1
+    transitionId += 1
+    for _, running in pairs(activeTweens) do
+        for _, t in pairs(running) do t:Cancel() end
+    end
+    table.clear(activeTweens)
+    table.clear(positionFollowers)
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    table.clear(connections)
+    changed:Destroy()
+end)
+
+do
+    for _, column in ipairs(settingsPage.columns) do
+        for _, child in ipairs(column:GetChildren()) do
+            if child:IsA("GuiObject") then child.LayoutOrder = child.LayoutOrder * 10 end
+        end
+    end
+    local motionControl = api:AddSlider({key="motionSpeed", text="animation speed", min=0.25, max=3, step=0.05, decimals=2,
+        value=1, suffix="x", tab="settings", callback=function(value) api:SetMotionSpeed(value) end}, 1)
+    motionControl.Frame.LayoutOrder = 35
+    local accentControl = api:AddColorPicker({key="customAccent", text="custom accent", value=C.accent, tab="settings",
+        callback=function(value) api:SetTheme({accent=value}) end}, 1)
+    accentControl.Frame.LayoutOrder = 36
+    local backgroundControl = api:AddColorPicker({key="menuBackground", text="menu background", value=C.bg, tab="settings",
+        callback=function(value) api:SetTheme({bg=value}) end}, 1)
+    backgroundControl.Frame.LayoutOrder = 37
+    for _, column in ipairs(settingsPage.columns) do column:SetAttribute("n", (column:GetAttribute("n") or 0) * 10) end
+end
+rebuildTabs()
+api:SelectTab(0)
+root.Visible = false
+if windowOptions.theme then
+    api:SetTheme(windowOptions.theme)
+    if windowOptions.theme.accent then api:Set("customAccent", windowOptions.theme.accent) end
+    if windowOptions.theme.bg then api:Set("menuBackground", windowOptions.theme.bg) end
+end
+if windowOptions.keybind then api:SetKeybind(windowOptions.keybind) end
+if windowOptions.motionSpeed then api:Set("motionSpeed", windowOptions.motionSpeed) end
+api:SetOpen(windowOptions.open ~= false)
+api.Gui = gui
+return api
+
+end
+function Library:CreateWindow(options)
+    assert(options == nil or type(options) == "table", "Window options must be a table")
+    local config = {}
+    for key, value in pairs(options or {}) do config[key] = value end
+    windowSerial = windowSerial + 1
+    config.id = config.id or ("SourceUI_" .. windowSerial)
+    assert(type(config.id) == "string" and #config.id > 0, "Window id must be a non-empty string")
+    assert(config.title == nil or type(config.title) == "string", "Window title must be text")
+    local window = createWindow(config)
+    windows[window] = true
+    return window
+end
+function Library:Destroy()
+    for window in pairs(windows) do window:Destroy() end
+    table.clear(windows)
+end
+return Library
