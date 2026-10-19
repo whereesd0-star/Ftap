@@ -1,56 +1,49 @@
--- Source UI Library 1.2 -- single-file ModuleScript, no UI is created by require().
--- Usage (place this file in a ModuleScript named SourceUI):
--- local UI = require(path.to.SourceUI)
--- local window = UI:CreateWindow({title="My menu", keybind=Enum.KeyCode.RightShift})
--- local tab = window:CreateTab({name="Main", icon="target"})
--- local section = tab:AddSection({name="Features", side="left"})
--- local toggle = section:AddToggle({key="enabled", text="Enabled", value=false,
---     callback=function(value) print(value) end})
--- toggle:AddColorPicker({key="color", value=Color3.fromRGB(155,212,90)}, "left")
--- local mini = toggle:AddSettings({title="Feature settings"}) -- compact 254 x 224
--- mini:AddSlider({key="amount", text="Amount", min=0, max=100, value=50})
--- mini:AddDropdown({key="mode", text="Mode", options={"Soft","Solid"}, value="Soft"})
--- mini:AddButton({text="Reset", callback=function() window:Set("amount",50) end})
--- tab:AddInput({key="name", text="Name", value=""}, "right")
---
--- Window options: id, title, parent, open, logo, avatar, fontFamily, keybind,
--- theme, motionSpeed, searchCacheLimit (0..128, default 32). Each window has isolated state/configs/connections.
--- Icon aliases: target, crosshair, eye, user, sliders, settings, shield, search,
--- check, chevron, palette. Tab icons also accept rbxassetid://... strings.
--- Tabs/sections/minis: AddToggle, AddSlider, AddDropdown, AddMultiDropdown,
--- AddInput, AddButton, AddColorPicker, AddLabel, AddSelect, AddSwatch.
--- Tabs/sections: AddSection({name=..., side="left"/"right"}); nesting is supported.
--- Handles: Get, Set, OnChanged, SetVisible; inputs/labels: SetText;
--- dropdowns: SetOptions; toggles: AddColorPicker(options, side).
--- Handles can AddSettings({title=..., height=160..288}); default height=224.
--- Minis: Open, Close, Toggle, IsOpen, SetTitle, AddSection("Title").
--- Window: CreateTab, GetSettingsTab, Set/Get, SetOptions, SetTheme/GetTheme,
--- SetMotionSpeed(0.25..3), SetKeybind(Enum.KeyCode), SetOpen(bool), Destroy.
--- Window.Tabs maps tab names to zero-based indices; tab:Select() is stable.
--- Color picker: live RGB/HEX, RGB clamp+round on commit, #RGB/#RRGGBB support.
--- Done/outside click/Escape/window close commits the active editor; Reset restores
--- the opening color. External Set/import updates active editor fields immediately.
--- Search mirrors inline colors and gears. SetVisible also hides search results.
--- SetTheme/SetMotionSpeed update Settings controls and configuration state.
--- Config import stages all values before invoking user callbacks.
--- Configs: SaveConfig, LoadConfig, DeleteConfig, ListConfigs,
--- ExportConfig/ImportConfig include full theme/keybind. Legacy v1 configs remain valid.
--- Named profiles are session-only; JSON is portable.
--- Built-in reserved keys: uiScale, accent, motionSpeed, customAccent,
--- menuBackground, configName, configProfile, configJson, configStatus.
--- Theme keys: bg, panel, row, rowHover, box, text, inactive, accent, stroke, label, title.
--- Settings/configs stay at the bottom; user tabs scroll independently.
--- Resource lifetimes: window/control/popup scopes, lazy alpha tween channels,
--- on-demand search with bounded inactive cache, idle render disconnection.
--- GetResourceStats() reports owned resources; it never forces garbage collection.
--- Icon metadata expires in 1 hour, failed requests back off for 30 seconds,
--- and library asset-status references are limited to 16 (engine texture cache is separate).
--- Named profile memory: 2 MiB per window; each JSON config <=128 KiB.
--- UI: original geometry/colors/animations, no CanvasGroup or gameplay handlers.
-
-local Library = {Version = "1.2.0"}
+local Library = {Version = "1.3.0"}
 local windows = setmetatable({}, {__mode = "k"})
 local windowSerial = 0
+local preferenceSpecs = {
+    title={key="menuTitle", kind="input", text="menu title", value="", maxLength=80},
+    roundness={key="menuRoundness", kind="slider", text="corner roundness", value=100, min=0, max=150, step=5, suffix="%"},
+    draggable={key="menuDraggable", kind="toggle", text="allow menu dragging", value=true},
+    dragMode={key="menuDragMode", kind="dropdown", text="drag area", value="Header", options={"Header", "Handle"}},
+    dragThreshold={key="menuDragThreshold", kind="slider", text="drag distance", value=6, min=2, max=24, step=1, suffix=" px"},
+    dragSmoothness={key="menuDragSmoothness", kind="slider", text="drag smoothing", value=35, min=0, max=120, step=5, suffix=" ms"},
+    floatingButton={key="menuFloatingButton", kind="toggle", text="show floating button", value=true},
+    floatingLocked={key="menuFloatingLocked", kind="toggle", text="lock floating position", value=false},
+    floatingSize={key="menuFloatingSize", kind="slider", text="floating button size", value=100, min=70, max=160, step=5, suffix="%"},
+}
+local function checkedPreferences(values)
+    assert(type(values) == "table", "Preferences must be a table")
+    local checked = {}
+    for name, value in pairs(values) do
+        local d = assert(preferenceSpecs[name], "Unknown preference: " .. tostring(name))
+        assert(type(value) == type(d.value), "Wrong preference type: " .. name)
+        if d.kind == "slider" then
+            assert(value == value and math.abs(value) < math.huge, "Preference must be finite: " .. name)
+            value = math.clamp(math.floor((value - d.min) / d.step + 0.5) * d.step + d.min, d.min, d.max)
+        elseif d.kind == "input" then
+            assert(utf8.len(value) and #value <= d.maxLength and not value:find("[%z\1-\31]"), "Invalid menu title")
+        elseif d.kind == "dropdown" then
+            assert(table.find(d.options, value), "Unknown preference option: " .. name)
+        end
+        checked[name] = value
+    end
+    return checked
+end
+local function checkedLayout(layout)
+    assert(type(layout) == "table", "Layout must be a table")
+    local checked = {}
+    for name, point in pairs(layout) do
+        assert(name == "window" or name == "floating", "Unknown layout position: " .. tostring(name))
+        assert(type(point) == "table", "Layout position must be a table")
+        for key in pairs(point) do assert(key == "x" or key == "y", "Unknown layout coordinate") end
+        for _, key in ipairs({"x", "y"}) do
+            assert(type(point[key]) == "number" and point[key] >= 0 and point[key] <= 1, "Layout coordinates must be finite and 0..1")
+        end
+        checked[name] = {x=point.x, y=point.y}
+    end
+    return checked
+end
 -- Each window, control and popup owns its resources. Disposal is idempotent.
 local Scope = {}
 Scope.__index = Scope
@@ -204,6 +197,7 @@ local openPopup, closePopup
 local closingPopups = {}
 local closeMini = function() end
 local motionSpeed = 1
+local customization = {roundness=1, dragSmoothness=35, corners=setmetatable({}, {__mode="k"})}
 local menuKey = Enum.KeyCode.RightShift
 local themeBindings = setmetatable({}, {__mode = "k"})
 local editors = setmetatable({}, {__mode = "k"})
@@ -285,6 +279,10 @@ local function new(class, container, properties)
     local fade = properties and properties.FadeTransparency
     for key, value in pairs(properties or {}) do
         if key ~= "FadeTransparency" then item[key] = value; bindTheme(item, key, value) end
+    end
+    if class == "UICorner" and item.CornerRadius.Scale == 0 then
+        customization.corners[item] = item.CornerRadius.Offset
+        item.CornerRadius = UDim.new(0, item.CornerRadius.Offset * customization.roundness)
     end
     item.Parent = container
     local keys = {}
@@ -420,7 +418,7 @@ ensureRender = function()
     if renderConnection or destroyed or rootScope.disposed then return end
     renderConnection = rootScope:Connect(RunService.RenderStepped, function(dt)
     if destroyed then return end
-    local alpha = 1 - math.exp(-dt / 0.035)
+    local alpha = customization.dragSmoothness == 0 and 1 or 1 - math.exp(-dt / (customization.dragSmoothness / 1000))
     for inst, target in pairs(positionFollowers) do
         if not inst.Parent then
             positionFollowers[inst] = nil
@@ -772,6 +770,7 @@ controls.slider = function(container, d)
     end
     local button = hit(frame, "Hit", 0, 0, 242, 52)
     connect(button.InputBegan, function(input)
+        if customization.gesture or activeSlider or activePicker then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             local gx, gw = track.AbsolutePosition.X, track.AbsoluteSize.X
             activeSlider = {fromX = fromX, knob = knob, input = input, gx = gx, gw = gw}
@@ -974,6 +973,11 @@ controls.dropdown = function(container, d) return dropdownControl(container, d, 
 controls.multidropdown = function(container, d) return dropdownControl(container, d, true) end
 controls.color = function(container, d)
     local frame = d.inline and rect(container, "InlineColor", 0, 0, 24, 24, C.box, 6) or row(container, 64)
+    -- Inline swatches keep a generous hit area without a visible backing plate.
+    if d.inline then
+        tween(frame, 0, {BackgroundTransparency=1})
+        frame:SetAttribute("NoTheme", true); themeBindings[frame] = nil
+    end
     if not d.inline then label(frame, "Label", d.text, 14, 5, 214, 22, labelColor, 14) end
     local field = d.inline and frame or rect(frame, "Field", 14, 32, 214, 24, C.box, 7)
     local caption = not d.inline and label(field, "Value", "", 8, 0, 166, 24, titleColor, 12) or nil
@@ -1293,6 +1297,7 @@ closePopup = function(immediate)
     end
 end
 openPopup = function(anchor, width, height, build, onClose)
+    if customization.CancelDrag then customization:CancelDrag() end
     if destroyed or unloading or not api.Open then return end
     closePopup(true)
     for old in pairs(closingPopups) do closingPopups[old] = nil; old.scope:Destroy() end
@@ -1725,6 +1730,7 @@ local function normalizeValue(d, value)
     elseif d.kind == "input" or d.kind == "label" then
         assert(utf8.len(value), "Text must be valid UTF-8")
         assert(#value <= (d.maxLength or 1024), "Text is too long for: " .. d.key)
+        if d.key == "menuTitle" then assert(not value:find("[%z\1-\31]"), "Invalid menu title") end
     end
     return value
 end
@@ -1794,7 +1800,7 @@ function api:ExportConfig()
     end
     local theme = {}
     for name, color in pairs(C) do theme[name] = color:ToHex() end
-    local json = HttpService:JSONEncode({format = "SourceMenu", version = 1, values = values, theme = theme, keybind = menuKey.Name})
+    local json = HttpService:JSONEncode({format = "SourceMenu", version = 1, values = values, theme = theme, keybind = menuKey.Name, layout = self:GetLayout()})
     assert(#json <= 131072, "Config exceeds 128 KiB; reduce long input values")
     return json
 end
@@ -1826,6 +1832,7 @@ function api:ImportConfig(json)
             end
             theme.accent = pending.customAccent or theme.accent
             theme.bg = pending.menuBackground or theme.bg
+            for name, key in pairs(customization.themeKeys or {}) do theme[name] = pending[key] or theme[name] end
         end
         if data.keybind ~= nil then
             assert(type(data.keybind) == "string", "Invalid config keybind")
@@ -1833,6 +1840,7 @@ function api:ImportConfig(json)
             assert(valid and typeof(candidate) == "EnumItem" and candidate.EnumType == Enum.KeyCode, "Invalid config keybind")
             keybind = candidate
         end
+        local layout = data.layout ~= nil and customization:CheckLayout(data.layout) or nil
         -- Stage every value before hooks/callbacks: they observe one coherent config.
         batching = true; table.clear(batchedKeys)
         for key, value in pairs(pending) do
@@ -1846,6 +1854,7 @@ function api:ImportConfig(json)
             if batchedKeys[d.key] and not d.callback and not (d.key == "accent" and pending.customAccent ~= nil) then callHook(d.key) end
         end
         if keybind then self:SetKeybind(keybind) end
+        if layout then self:SetLayout(layout) end
         local notifications = {}
         for _, d in ipairs(defs) do if batchedKeys[d.key] then notifications[#notifications + 1] = d.key end end
         batching = false; table.clear(batchedKeys)
@@ -2139,6 +2148,7 @@ function api:CreateMiniSettings(anchor, options)
     function mini:Open(reference)
         local target = reference or anchor
         if destroyed or unloading or not api.Open or not target.Parent then return self end
+        if customization.CancelDrag then customization:CancelDrag() end
         closeMini(true); closePopup(true)
         record.revision = record.revision + 1
         activeMini = record
@@ -2222,6 +2232,9 @@ function api:SetTheme(theme)
         if self.State.accent ~= preset then self:Set("accent", preset) end
     end
     if theme.bg and byKey.menuBackground and not sameValue(self.State.menuBackground, theme.bg) then self:Set("menuBackground", theme.bg) end
+    for name, key in pairs(customization.themeKeys or {}) do
+        if theme[name] and byKey[key] and not sameValue(self.State[key], theme[name]) then self:Set(key, theme[name]) end
+    end
     themeApplying = false
     return self
 end
@@ -2325,6 +2338,7 @@ function api:SelectTab(index)
     closePopup()
     closeMini()
     local previousTab = self.Tab
+    if customization.CancelDrag then customization:CancelDrag() end
     self.Tab = index
     selectedPage = pages[index + 1]
     for i = 1, #tabs do styleTab(i, i - 1 == index, true) end
@@ -2338,19 +2352,94 @@ function api:SelectTab(index)
     showDesired(index >= previousTab and 1 or -1)
 end
 
--- window dragging (header) and slider dragging
-local dragging, dragStart, startPosition, touchInput
-connect(header.InputBegan, function(input)
-    if not api.Open or winVeil.Visible then return end
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        local sx, sw = search.AbsolutePosition.X, search.AbsoluteSize.X
-        if input.Position.X >= sx and input.Position.X <= sx + sw then return end
-        positionFollowers[root] = nil
-        dragging = true; dragStart = input.Position; startPosition = root.Position
-        touchInput = input.UserInputType == Enum.UserInputType.Touch and input or nil
+-- One pointer owns a gesture. A press is only a candidate until it crosses
+-- the distance threshold; editing, overlays and transitions block new drags.
+local fab = asset(gui, "MenuButton", windowOptions.logo, "target", 24, 140, 36, 40)
+fab.Name = "MenuButton"; fab.Size = UDim2.fromOffset(36, 40)
+fab.ZIndex = 200
+local fabScale = new("UIScale", fab, {Scale = 1})
+local fabHit = hit(fab, "Hit", 0, 0, 36, 40)
+fabHit.Size = UDim2.fromScale(1, 1)
+local dragShield = hit(root, "DragInputShield", 0, 0, 600, 370)
+dragShield.ZIndex = 101; dragShield.Active = true; dragShield.Selectable = false; dragShield.Visible = false
+local dragHandle = rect(header, "DragHandle", 302, 10, 18, 24, C.panel, 4)
+tween(dragHandle, 0, {BackgroundTransparency=1})
+dragHandle.Visible = false; dragHandle.Active = true
+for x = 5, 11, 6 do
+    for y = 6, 18, 6 do rect(dragHandle, "Grip", x, y, 2, 2, C.inactive, "full") end
+end
+function customization:Contains(item, point)
+    local pos, size = item.AbsolutePosition, item.AbsoluteSize
+    return point.X >= pos.X and point.X <= pos.X + size.X and point.Y >= pos.Y and point.Y <= pos.Y + size.Y
+end
+function customization:Matches(input, ending)
+    local gesture = self.gesture
+    if not gesture then return false end
+    if gesture.input.UserInputType == Enum.UserInputType.Touch then return input == gesture.input end
+    return input.UserInputType == (ending and Enum.UserInputType.MouseButton1 or Enum.UserInputType.MouseMovement)
+end
+function customization:CancelDrag()
+    self.gesture = nil
+    dragShield.Visible = false
+    tween(fabScale, 0.15, {Scale=1})
+end
+function customization:BeginDrag(kind, input)
+    if destroyed or unloading or self.gesture or activeSlider or activePicker or Input:GetFocusedTextBox() then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if kind == "window" then
+        if not api.Open or winVeil.Visible or veil.Visible or popup.current or activeMini or not api.State.menuDraggable then return end
+        if not self:Contains(header, input.Position) or self:Contains(search, input.Position) then return end
+        if api.State.menuDragMode == "Handle" and not self:Contains(dragHandle, input.Position) then return end
+    elseif not fab.Visible or winVeil.Visible or popup.current or activeMini then
+        return
     end
-end)
+    local target = kind == "window" and root or fab
+    local position, size = target.Position, gui.AbsoluteSize
+    self.gesture = {kind=kind, input=input, x=input.Position.X, y=input.Position.Y,
+        origin=Vector2.new(position.X.Scale * size.X + position.X.Offset, position.Y.Scale * size.Y + position.Y.Offset),
+        threshold=math.max(api.State.menuDragThreshold, input.UserInputType == Enum.UserInputType.Touch and 10 or 0), moved=false}
+end
+function customization:MoveDrag(input)
+    if not self:Matches(input, false) then return end
+    local g = self.gesture
+    local dx, dy = input.Position.X - g.x, input.Position.Y - g.y
+    if not g.moved and dx * dx + dy * dy < g.threshold * g.threshold then return end
+    g.moved = true
+    if g.kind == "floating" and api.State.menuFloatingLocked then return end
+    if not g.started then
+        g.started = true
+        positionFollowers[g.kind == "window" and root or fab] = nil
+        if g.kind == "window" then dragShield.Visible = true else tween(fabScale, 0.1, {Scale=0.96}) end
+    end
+    local size = gui.AbsoluteSize
+    if g.kind == "window" then
+        local halfX = math.min(root.AbsoluteSize.X * 0.5 + 12, size.X * 0.5)
+        local halfY = math.min(root.AbsoluteSize.Y * 0.5 + 12, size.Y * 0.5)
+        local x = math.clamp(g.origin.X + dx, halfX, math.max(halfX, size.X - halfX))
+        local y = math.clamp(g.origin.Y + dy, halfY, math.max(halfY, size.Y - halfY))
+        homePos = UDim2.fromScale(x / math.max(size.X, 1), y / math.max(size.Y, 1))
+        followPosition(root, UDim2.fromOffset(x, y))
+    else
+        local factor = api.State.menuFloatingSize / 100
+        followPosition(fab, UDim2.fromOffset(
+            math.clamp(g.origin.X + dx, 0, math.max(0, size.X - 36 * factor)),
+            math.clamp(g.origin.Y + dy, 0, math.max(0, size.Y - 40 * factor))))
+    end
+end
+function customization:EndDrag(input)
+    if not self:Matches(input, true) then return end
+    local g = self.gesture
+    local dx, dy = input.Position.X - g.x, input.Position.Y - g.y
+    local tap = not g.moved and dx * dx + dy * dy < g.threshold * g.threshold
+    self:CancelDrag()
+    if g.kind == "floating" and tap and self:Contains(fab, input.Position) then api:SetOpen(not api.Open) end
+end
 header.Active = true
+connect(header.InputBegan, function(input) customization:BeginDrag("window", input) end)
+connect(dragHandle.InputBegan, function(input) customization:BeginDrag("window", input) end)
+connect(fabHit.InputBegan, function(input) customization:BeginDrag("floating", input) end)
+connect(fabHit.MouseEnter, function() if not customization.gesture then tween(fabScale, 0.15, {Scale=1.06}) end end)
+connect(fabHit.MouseLeave, function() if not customization.gesture then tween(fabScale, 0.15, {Scale=1}) end end)
 connect(Input.InputChanged, function(input)
     if activePicker and (input == activePicker.input or
         (activePicker.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)) then
@@ -2360,18 +2449,7 @@ connect(Input.InputChanged, function(input)
         (activeSlider.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)) then
         activeSlider.fromX(input.Position.X)
     end
-    if not dragging then return end
-    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= touchInput then return end
-    local delta = input.Position - dragStart
-    local size = gui.AbsoluteSize
-    local x = startPosition.X.Scale * size.X + startPosition.X.Offset + delta.X
-    local y = startPosition.Y.Scale * size.Y + startPosition.Y.Offset + delta.Y
-    local halfX = math.min(root.AbsoluteSize.X * 0.5 + 12, size.X * 0.5)
-    local halfY = math.min(root.AbsoluteSize.Y * 0.5 + 12, size.Y * 0.5)
-    homePos = UDim2.fromOffset(
-        math.clamp(x, halfX, math.max(halfX, size.X - halfX)),
-        math.clamp(y, halfY, math.max(halfY, size.Y - halfY)))
-    followPosition(root, homePos)
+    customization:MoveDrag(input)
 end)
 connect(Input.InputEnded, function(input)
     if activePicker and (input == activePicker.input or
@@ -2380,67 +2458,19 @@ connect(Input.InputEnded, function(input)
     end
     if activeSlider and (input == activeSlider.input or
         (activeSlider.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
-        tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)})
+        tween(activeSlider.knob, 0.12, {Size=UDim2.fromOffset(14, 14)})
         activeSlider = nil
     end
-    if (not touchInput and input.UserInputType == Enum.UserInputType.MouseButton1) or input == touchInput then
-        dragging = false; touchInput = nil
-    end
+    customization:EndDrag(input)
 end)
 connect(Input.InputBegan, function(input, processed)
-    if not processed and not Input:GetFocusedTextBox() and input.KeyCode == menuKey then
-        api:SetOpen(not api.Open)
-    end
+    if not processed and not Input:GetFocusedTextBox() and input.KeyCode == menuKey then api:SetOpen(not api.Open) end
 end)
-
--- floating draggable icon (no background): tap = open/close, drag = move
-local fab = asset(gui, "MenuButton", windowOptions.logo, "target", 24, 140, 36, 40)
-fab.ZIndex = 200
-local fabScale = new("UIScale", fab, {Scale = 1})
-local fabHit = hit(fab, "Hit", 0, 0, 36, 40)
-local fabDrag, fabStart, fabOrigin, fabInput, fabMoved = false, nil, nil, nil, false
-connect(fabHit.MouseEnter, function() if not fabDrag then tween(fabScale, 0.15, {Scale = 1.06}) end end)
-connect(fabHit.MouseLeave, function() if not fabDrag then tween(fabScale, 0.15, {Scale = 1}) end end)
-connect(fabHit.InputBegan, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        positionFollowers[fab] = nil
-        fabDrag = true; fabMoved = false
-        fabStart = input.Position; fabOrigin = fab.Position
-        fabInput = input.UserInputType == Enum.UserInputType.Touch and input or nil
-        tween(fabScale, 0.1, {Scale = 0.96})
-    end
-end)
-connect(Input.InputChanged, function(input)
-    if not fabDrag then return end
-    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= fabInput then return end
-    local delta = input.Position - fabStart
-    if not fabMoved and delta.Magnitude < 5 then return end
-    fabMoved = true
-    local size = gui.AbsoluteSize
-    followPosition(fab, UDim2.fromOffset(
-        math.clamp(fabOrigin.X.Offset + delta.X, 0, math.max(0, size.X - 36)),
-        math.clamp(fabOrigin.Y.Offset + delta.Y, 0, math.max(0, size.Y - 40))
-    ))
-end)
-connect(Input.InputEnded, function(input)
-    if not fabDrag then return end
-    if (not fabInput and input.UserInputType == Enum.UserInputType.MouseButton1) or input == fabInput then
-        fabDrag = false; fabInput = nil
-        tween(fabScale, 0.15, {Scale = 1})
-        if not fabMoved then api:SetOpen(not api.Open) end
-    end
-end)
-
--- Releasing focus may swallow InputEnded; never keep a drag latched.
 connect(Input.WindowFocusReleased, function()
-    closeMini()
-    closePopup()
-    activePicker = nil
-    dragging = false; touchInput = nil
-    fabDrag = false; fabInput = nil; fabMoved = false
-    tween(fabScale, 0.15, {Scale = 1})
+    closeMini(); closePopup(); activePicker = nil
+    customization:CancelDrag()
     if activeSlider then
-        tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)})
+        tween(activeSlider.knob, 0.12, {Size=UDim2.fromOffset(14, 14)})
         activeSlider = nil
     end
 end)
@@ -2466,17 +2496,68 @@ local function drawWindow()
     local home = homePoint()
     root.Position = UDim2.fromOffset(home.X, home.Y)
 end
+-- Layout uses viewport fractions, so saved positions adapt to another resolution.
+function customization:CheckLayout(layout) return checkedLayout(layout) end
+function customization:ClampFloating()
+    local size = gui.AbsoluteSize
+    local target = positionFollowers[fab] or fab.Position
+    positionFollowers[fab] = nil
+    local factor = (api.State.menuFloatingSize or 100) / 100
+    fab.Position = UDim2.fromOffset(
+        math.clamp(target.X.Scale * size.X + target.X.Offset, 0, math.max(0, size.X - 36 * factor)),
+        math.clamp(target.Y.Scale * size.Y + target.Y.Offset, 0, math.max(0, size.Y - 40 * factor)))
+end
+function api:GetPreferences()
+    local result = {}
+    for name, d in pairs(preferenceSpecs) do result[name] = self:Get(d.key) end
+    return result
+end
+function api:SetPreferences(values)
+    if destroyed or unloading then return self end
+    local checked = checkedPreferences(values)
+    for name, value in pairs(checked) do self:Set(preferenceSpecs[name].key, value) end
+    return self
+end
+function api:GetLayout()
+    if destroyed then return nil end
+    local size = gui.AbsoluteSize
+    local floating = positionFollowers[fab] or fab.Position
+    return {
+        window={x=math.clamp(homePos.X.Scale + homePos.X.Offset / math.max(size.X, 1), 0, 1),
+            y=math.clamp(homePos.Y.Scale + homePos.Y.Offset / math.max(size.Y, 1), 0, 1)},
+        floating={x=math.clamp(floating.X.Scale + floating.X.Offset / math.max(size.X, 1), 0, 1),
+            y=math.clamp(floating.Y.Scale + floating.Y.Offset / math.max(size.Y, 1), 0, 1)},
+    }
+end
+function api:SetLayout(layout)
+    if destroyed or unloading then return self end
+    local checked = customization:CheckLayout(layout)
+    commitFocusedEditor(true); closePopup(true); closeMini(true); customization:CancelDrag()
+    if checked.window then
+        positionFollowers[root] = nil
+        homePos = UDim2.fromScale(checked.window.x, checked.window.y)
+        drawWindow()
+    end
+    if checked.floating then
+        positionFollowers[fab] = nil
+        fab.Position = UDim2.fromScale(checked.floating.x, checked.floating.y)
+        customization:ClampFloating()
+    end
+    return self
+end
+function api:ResetLayout()
+    if destroyed or unloading then return self end
+    return self:SetLayout({window={x=0.5, y=0.5}, floating={x=24 / math.max(gui.AbsoluteSize.X, 1), y=140 / math.max(gui.AbsoluteSize.Y, 1)}})
+end
 connect(openness.Changed, drawWindow)
 connect(userScale.Changed, drawWindow)
 connect(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
-    local size = gui.AbsoluteSize
+    customization:CancelDrag()
     closePopup(true)
     closeMini(true)
     positionFollowers[root] = nil
     positionFollowers[fab] = nil
-    fab.Position = UDim2.fromOffset(
-        math.clamp(fab.Position.X.Offset, 0, math.max(0, size.X - fab.AbsoluteSize.X)),
-        math.clamp(fab.Position.Y.Offset, 0, math.max(0, size.Y - fab.AbsoluteSize.Y)))
+    customization:ClampFloating()
     drawWindow()
 end)
 function api:SetOpen(open)
@@ -2487,10 +2568,10 @@ function api:SetOpen(open)
     closePopup()
     closeMini()
     self.Open = open
-    if positionFollowers[root] then homePos = root.Position; positionFollowers[root] = nil end
+    if positionFollowers[root] then root.Position = positionFollowers[root]; positionFollowers[root] = nil end
     openRevision = openRevision + 1
     local revision = openRevision
-    dragging = false; touchInput = nil
+    customization:CancelDrag()
     if activeSlider then
         tween(activeSlider.knob, 0.12, {Size = UDim2.fromOffset(14, 14)})
         activeSlider = nil
@@ -2541,6 +2622,7 @@ connect(gui.Destroying, function()
     table.clear(dirtyVisuals); table.clear(dirtyScopes)
     table.clear(visuals); table.clear(fades); table.clear(scopeMembers)
     table.clear(themeBindings); table.clear(editors); table.clear(instanceScopes)
+    table.clear(customization.corners); customization.gesture = nil
     table.clear(closingPopups)
     table.clear(syncs); table.clear(hooks); table.clear(refreshers); table.clear(accentItems)
     for _, definition in ipairs(defs) do if definition.frames then table.clear(definition.frames) end; definition.decorate = nil end
@@ -2555,26 +2637,69 @@ connect(gui.Destroying, function()
     root = nil; header = nil; content = nil; search = nil; scroll = nil; empty = nil
     marker = nil; navigation = nil; border = nil; winVeil = nil; veil = nil; avatar = nil
     tabTitle = nil; keyHint = nil; scale = nil; intro = nil; userScale = nil; openness = nil
-    fab = nil; fabScale = nil; fabHit = nil; noSelection = nil
+    fab = nil; fabScale = nil; fabHit = nil; dragHandle = nil; dragShield = nil; noSelection = nil
     table.clear(windowOptions)
 end)
 
 do
     for _, column in ipairs(settingsPage.columns) do
         for _, child in ipairs(column:GetChildren()) do
-            if child:IsA("GuiObject") then child.LayoutOrder = child.LayoutOrder * 10 end
+            if child:IsA("GuiObject") then child.LayoutOrder = child.LayoutOrder * 100 end
         end
     end
-    local motionControl = api:AddSlider({key="motionSpeed", text="animation speed", min=0.25, max=3, step=0.05, decimals=2,
-        value=1, suffix="x", tab="settings", callback=function(value) api:SetMotionSpeed(value) end}, 1)
-    motionControl.Frame.LayoutOrder = 35
-    local accentControl = api:AddColorPicker({key="customAccent", text="custom accent", value=C.accent, tab="settings",
-        callback=function(value) api:SetTheme({accent=value}) end}, 1)
-    accentControl.Frame.LayoutOrder = 36
-    local backgroundControl = api:AddColorPicker({key="menuBackground", text="menu background", value=C.bg, tab="settings",
-        callback=function(value) api:SetTheme({bg=value}) end}, 1)
-    backgroundControl.Frame.LayoutOrder = 37
-    for _, column in ipairs(settingsPage.columns) do column:SetAttribute("n", (column:GetAttribute("n") or 0) * 10) end
+    local function place(handle, order) handle.Frame.LayoutOrder = order; return handle end
+    place(api:AddSlider({key="motionSpeed", text="animation speed", min=0.25, max=3, step=0.05, decimals=2,
+        value=1, suffix="x", tab="settings", callback=function(value) api:SetMotionSpeed(value) end}, 1), 350)
+    place(api:AddColorPicker({key="customAccent", text="custom accent", value=C.accent, tab="settings",
+        callback=function(value) api:SetTheme({accent=value}) end}, 1), 360)
+    place(api:AddColorPicker({key="menuBackground", text="menu background", value=C.bg, tab="settings",
+        callback=function(value) api:SetTheme({bg=value}) end}, 1), 370)
+    customization.themeKeys = {}
+    local paletteMini
+    local palette = place(api:AddButton({text="more theme colors", tab="settings", searchable=false,
+        callback=function() paletteMini:Open() end}, 1), 380)
+    paletteMini = palette:AddSettings({title="Menu palette", height=224})
+    local defaultTheme = copyValue(C)
+    for _, token in ipairs({"panel", "row", "rowHover", "box", "label", "title", "text", "inactive", "stroke"}) do
+        local key = "menuColor_" .. token
+        customization.themeKeys[token] = key
+        paletteMini:AddColorPicker({key=key, text=token, value=C[token], searchable=false,
+            callback=function(value) api:SetTheme({[token]=value}) end})
+    end
+    paletteMini:AddButton({text="reset palette", callback=function() api:SetTheme(defaultTheme) end})
+    local orders = {title=390, roundness=395, draggable=420, dragMode=430, dragThreshold=440,
+        dragSmoothness=450, floatingButton=460, floatingLocked=470, floatingSize=480}
+    section(settingsPage.columns[2], "Movement & floating button").LayoutOrder = 410
+    local function applyPreference(name, value)
+        if name == "title" then
+            windowOptions.title = value ~= "" and value or nil
+            if current then setTitle(windowOptions.title and (windowOptions.title .. " / " .. current.title) or current.title) end
+        elseif name == "roundness" then
+            customization.roundness = value / 100
+            for corner, radius in pairs(customization.corners) do
+                if corner.Parent then corner.CornerRadius = UDim.new(0, radius * customization.roundness) end
+            end
+        elseif name == "dragSmoothness" then
+            customization.dragSmoothness = value
+        elseif name == "floatingButton" then
+            customization:CancelDrag(); positionFollowers[fab] = nil; fab.Visible = value
+        elseif name == "floatingSize" then
+            customization:CancelDrag()
+            fab.Size = UDim2.fromOffset(36 * value / 100, 40 * value / 100)
+            customization:ClampFloating()
+        else
+            customization:CancelDrag()
+            dragHandle.Visible = api.State.menuDraggable and api.State.menuDragMode == "Handle"
+        end
+    end
+    for name, spec in pairs(preferenceSpecs) do
+        local d = copyValue(spec); d.tab = "settings"
+        if name == "title" then d.value = windowOptions.title or "" end
+        d.callback = function(value) applyPreference(name, value) end
+        place(api:AddControl(d.kind, d, (name == "title" or name == "roundness") and 1 or 2), orders[name])
+    end
+    place(api:AddButton({text="reset menu position", tab="settings", callback=function() api:ResetLayout() end}, 2), 490)
+    for _, column in ipairs(settingsPage.columns) do column:SetAttribute("n", (column:GetAttribute("n") or 0) * 100) end
 end
 rebuildTabs()
 api:SelectTab(0)
@@ -2586,6 +2711,8 @@ if windowOptions.theme then
 end
 if windowOptions.keybind then api:SetKeybind(windowOptions.keybind) end
 if windowOptions.motionSpeed then api:Set("motionSpeed", windowOptions.motionSpeed) end
+if windowOptions.preferences then api:SetPreferences(windowOptions.preferences) end
+if windowOptions.layout then api:SetLayout(windowOptions.layout) end
 api:SetOpen(windowOptions.open ~= false)
 api.Gui = gui
 return api
@@ -2612,6 +2739,9 @@ function Library:CreateWindow(options)
             for _, channel in ipairs({color.R, color.G, color.B}) do assert(channel >= 0 and channel <= 1, "Color channels must be finite and 0..1") end
         end
     end
+    if config.title then checkedPreferences({title=config.title}) end
+    if config.preferences ~= nil then config.preferences = checkedPreferences(config.preferences) end
+    if config.layout ~= nil then config.layout = checkedLayout(config.layout) end
     local window = createWindow(config)
     windows[window] = true
     return window
