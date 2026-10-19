@@ -1,6 +1,122 @@
-local Library = {Version = "1.1.0"}
+-- Source UI Library 1.2 -- single-file ModuleScript, no UI is created by require().
+-- Usage (place this file in a ModuleScript named SourceUI):
+-- local UI = require(path.to.SourceUI)
+-- local window = UI:CreateWindow({title="My menu", keybind=Enum.KeyCode.RightShift})
+-- local tab = window:CreateTab({name="Main", icon="target"})
+-- local section = tab:AddSection({name="Features", side="left"})
+-- local toggle = section:AddToggle({key="enabled", text="Enabled", value=false,
+--     callback=function(value) print(value) end})
+-- toggle:AddColorPicker({key="color", value=Color3.fromRGB(155,212,90)}, "left")
+-- local mini = toggle:AddSettings({title="Feature settings"}) -- compact 254 x 224
+-- mini:AddSlider({key="amount", text="Amount", min=0, max=100, value=50})
+-- mini:AddDropdown({key="mode", text="Mode", options={"Soft","Solid"}, value="Soft"})
+-- mini:AddButton({text="Reset", callback=function() window:Set("amount",50) end})
+-- tab:AddInput({key="name", text="Name", value=""}, "right")
+--
+-- Window options: id, title, parent, open, logo, avatar, fontFamily, keybind,
+-- theme, motionSpeed, searchCacheLimit (0..128, default 32). Each window has isolated state/configs/connections.
+-- Icon aliases: target, crosshair, eye, user, sliders, settings, shield, search,
+-- check, chevron, palette. Tab icons also accept rbxassetid://... strings.
+-- Tabs/sections/minis: AddToggle, AddSlider, AddDropdown, AddMultiDropdown,
+-- AddInput, AddButton, AddColorPicker, AddLabel, AddSelect, AddSwatch.
+-- Tabs/sections: AddSection({name=..., side="left"/"right"}); nesting is supported.
+-- Handles: Get, Set, OnChanged, SetVisible; inputs/labels: SetText;
+-- dropdowns: SetOptions; toggles: AddColorPicker(options, side).
+-- Handles can AddSettings({title=..., height=160..288}); default height=224.
+-- Minis: Open, Close, Toggle, IsOpen, SetTitle, AddSection("Title").
+-- Window: CreateTab, GetSettingsTab, Set/Get, SetOptions, SetTheme/GetTheme,
+-- SetMotionSpeed(0.25..3), SetKeybind(Enum.KeyCode), SetOpen(bool), Destroy.
+-- Window.Tabs maps tab names to zero-based indices; tab:Select() is stable.
+-- Color picker: live RGB/HEX, RGB clamp+round on commit, #RGB/#RRGGBB support.
+-- Done/outside click/Escape/window close commits the active editor; Reset restores
+-- the opening color. External Set/import updates active editor fields immediately.
+-- Search mirrors inline colors and gears. SetVisible also hides search results.
+-- SetTheme/SetMotionSpeed update Settings controls and configuration state.
+-- Config import stages all values before invoking user callbacks.
+-- Configs: SaveConfig, LoadConfig, DeleteConfig, ListConfigs,
+-- ExportConfig/ImportConfig include full theme/keybind. Legacy v1 configs remain valid.
+-- Named profiles are session-only; JSON is portable.
+-- Built-in reserved keys: uiScale, accent, motionSpeed, customAccent,
+-- menuBackground, configName, configProfile, configJson, configStatus.
+-- Theme keys: bg, panel, row, rowHover, box, text, inactive, accent, stroke, label, title.
+-- Settings/configs stay at the bottom; user tabs scroll independently.
+-- Resource lifetimes: window/control/popup scopes, lazy alpha tween channels,
+-- on-demand search with bounded inactive cache, idle render disconnection.
+-- GetResourceStats() reports owned resources; it never forces garbage collection.
+-- Icon metadata expires in 1 hour, failed requests back off for 30 seconds,
+-- and library asset-status references are limited to 16 (engine texture cache is separate).
+-- Named profile memory: 2 MiB per window; each JSON config <=128 KiB.
+-- UI: original geometry/colors/animations, no CanvasGroup or gameplay handlers.
+
+local Library = {Version = "1.2.0"}
 local windows = setmetatable({}, {__mode = "k"})
 local windowSerial = 0
+-- Each window, control and popup owns its resources. Disposal is idempotent.
+local Scope = {}
+Scope.__index = Scope
+function Scope.new(parent)
+    local self = setmetatable({connections={}, cleanups={}, instances={}, children={}, tasks={}, disposed=false, parent=parent}, Scope)
+    if parent then parent.children[self] = true end
+    return self
+end
+function Scope:Add(cleanup)
+    if self.disposed then cleanup(); return cleanup end
+    self.cleanups[cleanup] = true
+    return cleanup
+end
+function Scope:Connect(signal, callback)
+    local connection = signal:Connect(function(...)
+        if not self.disposed then return callback(...) end
+    end)
+    self.connections[connection] = true
+    return connection
+end
+function Scope:Disconnect(connection)
+    if connection then connection:Disconnect(); self.connections[connection] = nil end
+end
+function Scope:Own(instance) self.instances[instance] = true; return instance end
+function Scope:Forget(instance) self.instances[instance] = nil end
+function Scope:Spawn(callback)
+    if self.disposed then return end
+    local thread = coroutine.create(function()
+        local ok, message = pcall(callback)
+        self.tasks[coroutine.running()] = nil
+        if not ok and not self.disposed then warn("Source UI task: " .. tostring(message)) end
+    end)
+    self.tasks[thread] = true
+    task.spawn(thread)
+    return thread
+end
+function Scope:Destroy()
+    if self.disposed then return end
+    self.disposed = true
+    if self.parent then self.parent.children[self] = nil; self.parent = nil end
+    for connection in pairs(self.connections) do connection:Disconnect() end
+    table.clear(self.connections)
+    for thread in pairs(self.tasks) do
+        if thread ~= coroutine.running() then pcall(task.cancel, thread) end
+    end
+    table.clear(self.tasks)
+    for child in pairs(self.children) do child:Destroy() end
+    table.clear(self.children)
+    for cleanup in pairs(self.cleanups) do
+        local ok, message = pcall(cleanup)
+        if not ok then warn("Source UI cleanup: " .. tostring(message)) end
+    end
+    table.clear(self.cleanups)
+    for instance in pairs(self.instances) do instance:Destroy() end
+    table.clear(self.instances)
+end
+function Scope:Counts(result)
+    result = result or {connections=0, tasks=0, scopes=0}
+    if self.disposed then return result end
+    result.scopes = result.scopes + 1
+    for connection in pairs(self.connections) do if connection.Connected then result.connections = result.connections + 1 end end
+    for _ in pairs(self.tasks) do result.tasks = result.tasks + 1 end
+    for child in pairs(self.children) do child:Counts(result) end
+    return result
+end
+
 local function createWindow(windowOptions)
 local Players = game:GetService("Players")
 local Input = game:GetService("UserInputService")
@@ -76,12 +192,16 @@ local icons = {
     palette = {77139486329738, {96,96}, {672,384}},
 }
 
-local connections = {}
+local rootScope = Scope.new()
+local currentScope = rootScope
+local instanceScopes = setmetatable({}, {__mode="k"})
 local destroyed = false
 local unloading = false
 local gui, root
+local noSelection
 local popup = {}
 local openPopup, closePopup
+local closingPopups = {}
 local closeMini = function() end
 local motionSpeed = 1
 local menuKey = Enum.KeyCode.RightShift
@@ -101,31 +221,46 @@ local activeTweens = setmetatable({}, {__mode = "k"})
 ----------------------------------------------------------------------
 -- helpers
 ----------------------------------------------------------------------
-local function connect(signal, callback)
-    local connection = signal:Connect(callback)
-    table.insert(connections, connection)
-    return connection
-end
--- Opacity scopes use ordinary Frames. Each property retains its own local value,
--- including hover and text fades; nested scopes multiply their visibility.
-local visuals, fades = {}, {}
+local function connect(signal, callback) return currentScope:Connect(signal, callback) end
+-- Static alpha is a number. Tween channels are allocated only when animated.
+local visuals, fades, scopeMembers = {}, {}, {}
+local dirtyVisuals, dirtyScopes = {}, {}
+local ensureRender
 local function renderVisual(item)
     local record = visuals[item]
     if not record then return end
-    local opacity, node = 1, item
-    while node do
-        if fades[node] then opacity = opacity * (1 - fades[node].Value) end
-        node = node.Parent
-    end
-    -- Rendered properties are output only. Roblox rounds GUI alpha to float32;
-    -- reading deferred property notifications back into local alpha causes drift.
-    for key, value in pairs(record.values) do
-        item[key] = math.clamp(1 - (1 - value.Value) * opacity, 0, 1)
-    end
+    local opacity = 1
+    for _, frame in ipairs(record.scopes) do opacity = opacity * (1 - fades[frame].Value) end
+    for key, value in pairs(record.values) do item[key] = math.clamp(1 - (1 - value) * opacity, 0, 1) end
 end
 local function renderTree(item)
+    local members = scopeMembers[item]
+    if members then
+        for member in pairs(members) do renderVisual(member) end
+    else
+        renderVisual(item)
+        for _, child in ipairs(item:GetDescendants()) do renderVisual(child) end
+    end
+end
+local function markVisual(item)
+    dirtyVisuals[item] = true
+    if ensureRender then ensureRender() end
+end
+local function markScope(item)
+    dirtyScopes[item] = true
+    if ensureRender then ensureRender() end
+end
+local function attachVisual(item)
+    local record = visuals[item]
+    if not record then return end
+    for _, frame in ipairs(record.scopes) do if scopeMembers[frame] then scopeMembers[frame][item] = nil end end
+    table.clear(record.scopes)
+    local node = item
+    while node do
+        if fades[node] then record.scopes[#record.scopes + 1] = node; scopeMembers[node][item] = true end
+        node = node.Parent
+    end
     renderVisual(item)
-    for _, child in ipairs(item:GetDescendants()) do renderVisual(child) end
 end
 local function bindTheme(item, key, value)
     if typeof(value) ~= "Color3" then return end
@@ -141,6 +276,12 @@ local function bindTheme(item, key, value)
 end
 local function new(class, container, properties)
     local item = Instance.new(class)
+    local owner = currentScope
+    instanceScopes[item] = owner
+    if item:IsA("GuiObject") then
+        item.BorderSizePixel = 0
+        if noSelection then item.SelectionImageObject = noSelection end
+    end
     local fade = properties and properties.FadeTransparency
     for key, value in pairs(properties or {}) do
         if key ~= "FadeTransparency" then item[key] = value; bindTheme(item, key, value) end
@@ -154,38 +295,62 @@ local function new(class, container, properties)
     if class == "ImageLabel" or class == "ImageButton" then keys[#keys + 1] = "ImageTransparency" end
     if class == "ScrollingFrame" then keys[#keys + 1] = "ScrollBarImageTransparency" end
     if class == "UIStroke" then keys[#keys + 1] = "Transparency" end
-    local record = {values = {}, connections = {}}
-    local function listen(signal, fn) record.connections[#record.connections + 1] = signal:Connect(fn) end
+    local record = {values={}, channels={}, scopes={}, connections={}}
+    local function listen(signal, fn)
+        local connection = owner:Connect(signal, fn)
+        record.connections[connection] = true
+        return connection
+    end
     if #keys > 0 then
         visuals[item] = record
-        for _, key in ipairs(keys) do
-            local value = Instance.new("NumberValue")
-            value.Value = item[key]
-            record.values[key] = value
-            listen(value.Changed, function() renderVisual(item) end)
-        end
+        for _, key in ipairs(keys) do record.values[key] = item[key] end
     end
     if fade ~= nil then
         local value = Instance.new("NumberValue")
-        value.Value = fade; fades[item] = value
-        listen(value.Changed, function() renderTree(item) end)
+        value.Value = fade; fades[item] = value; scopeMembers[item] = {}
+        listen(value.Changed, function() markScope(item) end)
     end
     if #keys > 0 or fade ~= nil then
-        listen(item:GetPropertyChangedSignal("Parent"), function() renderTree(item) end)
-        item.Destroying:Connect(function()
-            for _, connection in ipairs(record.connections) do connection:Disconnect() end
+        local cleaned = false
+        local cleanup
+        cleanup = function()
+            if cleaned then return end
+            cleaned = true
+            owner.cleanups[cleanup] = nil
+            for connection in pairs(record.connections) do owner:Disconnect(connection) end
             if activeTweens[item] then
                 for _, animation in pairs(activeTweens[item]) do animation:Cancel() end
                 activeTweens[item] = nil
             end
-            for _, value in pairs(record.values) do value:Destroy() end
-            if fades[item] then fades[item]:Destroy(); fades[item] = nil end
-            visuals[item] = nil
-            editors[item] = nil
+            for _, frame in ipairs(record.scopes) do if scopeMembers[frame] then scopeMembers[frame][item] = nil end end
+            for _, channel in pairs(record.channels) do channel.value:Destroy() end
+            if fades[item] then fades[item]:Destroy(); fades[item] = nil; scopeMembers[item] = nil end
+            visuals[item] = nil; editors[item] = nil; themeBindings[item] = nil; instanceScopes[item] = nil
+            dirtyVisuals[item] = nil; dirtyScopes[item] = nil
+        end
+        owner:Add(cleanup)
+        listen(item:GetPropertyChangedSignal("Parent"), function()
+            attachVisual(item)
+            for _, child in ipairs(item:GetDescendants()) do attachVisual(child) end
         end)
-        renderVisual(item)
+        listen(item.Destroying, cleanup)
+        attachVisual(item)
     end
     return item
+end
+local function alphaChannel(inst, key)
+    local record = visuals[inst]
+    if not record.channels[key] then
+        local value = Instance.new("NumberValue")
+        value.Value = record.values[key]
+        local connection = instanceScopes[inst]:Connect(value.Changed, function()
+            record.values[key] = value.Value
+            markVisual(inst)
+        end)
+        record.connections[connection] = true
+        record.channels[key] = {value=value, connection=connection}
+    end
+    return record.channels[key].value
 end
 local function tween(inst, time, props, style, dir)
     time = time / motionSpeed
@@ -196,14 +361,27 @@ local function tween(inst, time, props, style, dir)
     for key, value in pairs(props) do
         bindTheme(inst, key, value)
         if running[key] then running[key]:Cancel() end
+        activeTweens[inst] = running
         local target, property = inst, key
         if key == "FadeTransparency" then
             target, property = assert(fades[inst]), "Value"
         elseif visuals[inst] and visuals[inst].values[key] then
-            target, property = visuals[inst].values[key], "Value"
+            if time <= 0 then
+                local record = visuals[inst]
+                record.values[key] = value
+                if record.channels[key] then record.channels[key].value.Value = value end
+                renderVisual(inst)
+                running[key] = nil
+                target, property = nil, nil
+            else
+                target, property = alphaChannel(inst, key), "Value"
+            end
         end
-        if destroyed or time <= 0 then
+        if not target then
+            -- A static alpha update does not need a NumberValue.
+        elseif destroyed or time <= 0 then
             target[property] = value
+            if key == "FadeTransparency" then renderTree(inst) end
             running[key] = nil
         else
             local t = TweenService:Create(target,
@@ -211,29 +389,36 @@ local function tween(inst, time, props, style, dir)
                 {[property] = value})
             running[key] = t
             local done
-            done = t.Completed:Connect(function()
-                done:Disconnect()
+            local owner = instanceScopes[inst] or rootScope
+            done = owner:Connect(t.Completed, function()
+                owner:Disconnect(done)
                 if running[key] == t then running[key] = nil end
+                if not next(running) and activeTweens[inst] == running then activeTweens[inst] = nil end
             end)
             t:Play()
             last = t
         end
     end
+    if not next(running) then activeTweens[inst] = nil end
     return last
 end
 local function afterTween(animation, callback)
     if not animation then return end
     local done
-    done = animation.Completed:Connect(function(state)
-        done:Disconnect()
+    done = rootScope:Connect(animation.Completed, function(state)
+        rootScope:Disconnect(done)
         if not destroyed and state == Enum.PlaybackState.Completed then callback() end
     end)
 end
 local positionFollowers = setmetatable({}, {__mode = "k"})
 local function followPosition(inst, target)
     positionFollowers[inst] = target
+    ensureRender()
 end
-connect(RunService.RenderStepped, function(dt)
+local renderConnection
+ensureRender = function()
+    if renderConnection or destroyed or rootScope.disposed then return end
+    renderConnection = rootScope:Connect(RunService.RenderStepped, function(dt)
     if destroyed then return end
     local alpha = 1 - math.exp(-dt / 0.035)
     for inst, target in pairs(positionFollowers) do
@@ -251,7 +436,13 @@ connect(RunService.RenderStepped, function(dt)
             end
         end
     end
-end)
+    for item in pairs(dirtyScopes) do dirtyScopes[item] = nil; renderTree(item) end
+    for item in pairs(dirtyVisuals) do dirtyVisuals[item] = nil; renderVisual(item) end
+    if not next(positionFollowers) and not next(dirtyScopes) and not next(dirtyVisuals) then
+        rootScope:Disconnect(renderConnection); renderConnection = nil
+    end
+    end)
+end
 local function stroke(item, color, transparency)
     return new("UIStroke", item, {
         Color = color or C.stroke, Thickness = 1, Transparency = transparency or 0,
@@ -302,36 +493,64 @@ end
 local cacheKey = "__SourceMenuIcons_v2"
 local iconCache = cacheEnvironment[cacheKey]
 if type(iconCache) ~= "table" or iconCache.url ~= ICON_URL then
-    iconCache = {url = ICON_URL, icons = icons, assets = {}, fetched = false, loading = false}
+    iconCache = {url = ICON_URL, icons = icons, assets = {}, assetTimes = {}, fetched = false, loading = false}
     cacheEnvironment[cacheKey] = iconCache
 end
+iconCache.assets = iconCache.assets or {}; iconCache.assetTimes = iconCache.assetTimes or {}
+if iconCache.fetched and not iconCache.fetchedAt then iconCache.fetchedAt = os.time() end
+if iconCache.loading and not iconCache.requestToken then iconCache.loading = false end
+for uri, state in pairs(iconCache.assets) do
+    if state == "loading" then iconCache.assets[uri] = nil end
+    if state == true and not iconCache.assetTimes[uri] then iconCache.assetTimes[uri] = os.time() end
+end
 if type(iconCache.icons) == "table" then icons = iconCache.icons end
+local pendingAssets, requestToken = {}, nil
+rootScope:Add(function()
+    for uri, token in pairs(pendingAssets) do if iconCache.assets[uri] == token then iconCache.assets[uri] = nil end end
+    table.clear(pendingAssets)
+    if requestToken and iconCache.requestToken == requestToken then iconCache.loading = false; iconCache.requestToken = nil end
+end)
 local function preloadIcons()
     local ok, provider = pcall(function() return game:GetService("ContentProvider") end)
     if not ok then return end
     local assets = {}
     for _, data in pairs(icons) do
         local uri = "rbxassetid://" .. data[1]
-        if not iconCache.assets[uri] then iconCache.assets[uri] = "loading"; assets[#assets + 1] = uri end
+        if not iconCache.assets[uri] then
+            local token = {}; pendingAssets[uri] = token; iconCache.assets[uri] = token
+            assets[#assets + 1] = uri
+        end
     end
     if #assets == 0 then return end
     local loaded = pcall(function()
         provider:PreloadAsync(assets, function(uri, status)
+            if rootScope.disposed then return end
             iconCache.assets[uri] = status == Enum.AssetFetchStatus.Success and true or nil
+            iconCache.assetTimes[uri] = os.time(); pendingAssets[uri] = nil
         end)
     end)
-    if not loaded then for _, uri in ipairs(assets) do iconCache.assets[uri] = nil end end
+    if not loaded then for _, uri in ipairs(assets) do iconCache.assets[uri] = nil; pendingAssets[uri] = nil end end
+    local entries = {}
+    for uri, timestamp in pairs(iconCache.assetTimes) do entries[#entries+1] = {uri, timestamp} end
+    table.sort(entries, function(a,b) return a[2] < b[2] end)
+    for i=1, math.max(0, #entries - 16) do
+        local uri = entries[i][1]; iconCache.assets[uri] = nil; iconCache.assetTimes[uri] = nil
+    end
 end
-task.spawn(preloadIcons)
+rootScope:Spawn(preloadIcons)
 -- Fetch asynchronously; the menu remains usable if client HTTP is unavailable.
 -- Only asset IDs and crop coordinates are parsed; remote source is never executed.
-task.spawn(function()
-    if iconCache.fetched or iconCache.loading then return end
+rootScope:Spawn(function()
+    local now = os.time()
+    if iconCache.loading or (iconCache.retryAt or 0) > now then return end
+    if iconCache.fetched and now - (iconCache.fetchedAt or now) < 3600 then return end
+    requestToken = {}; iconCache.requestToken = requestToken
     iconCache.loading = true
     local ok, source = pcall(function() return HttpService:GetAsync(ICON_URL) end)
     if not ok then ok, source = pcall(function() return game:HttpGet(ICON_URL) end) end
-    iconCache.loading = false
-    if not ok or type(source) ~= "string" or #source > 1000000 then return end
+    if rootScope.disposed or iconCache.requestToken ~= requestToken then return end
+    iconCache.loading = false; iconCache.requestToken = nil
+    if not ok or type(source) ~= "string" or #source > 1000000 then iconCache.retryAt = os.time() + 30; return end
     local sheets = {}
     for id, assetId in source:gmatch('%["(%d+)"%]%s*=%s*"rbxassetid://(%d+)"') do sheets[tonumber(id)] = assetId end
     for alias, name in pairs(iconNames) do
@@ -345,7 +564,7 @@ task.spawn(function()
             end
         end
     end
-    iconCache.icons = icons; iconCache.fetched = true
+    iconCache.icons = icons; iconCache.fetched = true; iconCache.fetchedAt = os.time(); iconCache.retryAt = nil
     preloadIcons()
     if gui and not destroyed then
         for _, item in ipairs(gui:GetDescendants()) do
@@ -358,13 +577,21 @@ task.spawn(function()
         end
     end
 end)
+noSelection = rootScope:Own(Instance.new("Frame"))
+noSelection.Name = "NoSelection"; noSelection.BackgroundTransparency = 1; noSelection.BorderSizePixel = 0
+noSelection.Size = UDim2.fromOffset(0, 0)
 local function hit(container, name, x,y,w,h)
     local button = new("TextButton", container, {
         Name = name, Position = UDim2.fromOffset(x,y), Size = UDim2.fromOffset(w,h),
-        BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+        SelectionImageObject = noSelection,
     })
-    local commitConnection = button.Activated:Connect(function() commitFocusedEditor(true) end)
-    button.Destroying:Connect(function() commitConnection:Disconnect() end)
+    local owner = currentScope
+    local commitConnection = owner:Connect(button.Activated, function() commitFocusedEditor(true) end)
+    local cleanup
+    cleanup = function() owner:Disconnect(commitConnection); owner.cleanups[cleanup] = nil end
+    owner:Add(cleanup)
+    owner:Connect(button.Destroying, cleanup)
     return button
 end
 local function ord(container)
@@ -393,7 +620,7 @@ local function setAccent(color)
             for property in pairs(properties) do themeBindings[inst][property] = "accent" end
         end
     end
-    for _, fn in ipairs(refreshers) do fn() end
+    for fn in pairs(refreshers) do fn() end
 end
 
 local function asset(container, name, uri, fallback, x,y,w,h)
@@ -435,6 +662,19 @@ local function def(d)
     syncs[d.key] = {}
     api.State[d.key] = copyValue(d.value)
     return d
+end
+local function registerSync(key, callback)
+    table.insert(syncs[key], callback)
+    local owner = currentScope
+    owner:Add(function()
+        local callbacks = syncs[key]
+        local index = callbacks and table.find(callbacks, callback)
+        if index then table.remove(callbacks, index) end
+    end)
+end
+local function registerRefresher(callback)
+    refreshers[callback] = true
+    currentScope:Add(function() refreshers[callback] = nil end)
 end
 -- Settings
 def{key="uiScale", kind="slider", text="menu scale", value=100, min=70, max=120, step=5, suffix="%"}
@@ -484,8 +724,8 @@ controls.toggle = function(container, d)
             BackgroundColor3 = on and C.panel or Color3.fromRGB(137,142,152),
         })
     end
-    table.insert(syncs[d.key], sync)
-    table.insert(refreshers, function() sync(true) end)
+    registerSync(d.key, sync)
+    registerRefresher(function() sync(true) end)
     sync(false)
     local button = hit(frame, "Toggle", 0, 0, 242, 38)
     connect(button.Activated, function() api:Set(d.key, not api.State[d.key]) end)
@@ -519,7 +759,7 @@ controls.slider = function(container, d)
         tween(displayed, animated and 0.14 or 0, {Value = api.State[d.key]})
         if not animated then drawValue() end
     end
-    table.insert(syncs[d.key], sync)
+    registerSync(d.key, sync)
     sync(false)
     local function fromX(x, gx, gw)
         local w = gw or track.AbsoluteSize.X
@@ -572,7 +812,7 @@ controls.select = function(container, d)
             })
         end
     end
-    table.insert(syncs[d.key], sync)
+    registerSync(d.key, sync)
     sync(false)
     for _, optionButton in ipairs(buttons) do hoverRow(frame, optionButton) end
     return frame
@@ -610,7 +850,7 @@ controls.swatch = function(container, d)
             tween(ring, animated and 0.2 or 0, {Transparency = i == api.State[d.key] and 0 or 1})
         end
     end
-    table.insert(syncs[d.key], sync)
+    registerSync(d.key, sync)
     sync(false)
     return frame
 end
@@ -632,7 +872,7 @@ controls.label = function(container, d)
             tween(text, 0.16, {TextTransparency = 0})
         end)
     end
-    table.insert(syncs[d.key], sync); sync(false)
+    registerSync(d.key, sync); sync(false)
     return frame
 end
 controls.input = function(container, d)
@@ -652,7 +892,7 @@ controls.input = function(container, d)
     new("UIPadding", box, {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, d.multiline and 6 or 0)})
     local line = stroke(box, C.stroke, 0.5)
     local function sync() box.Text = api.State[d.key] end
-    table.insert(syncs[d.key], sync); sync()
+    registerSync(d.key, sync); sync()
     connect(box.Focused, function() tween(line, 0.16, {Color = C.accent, Transparency = 0.1}) end)
     local function commit()
         tween(line, 0.16, {Color = C.stroke, Transparency = 0.5})
@@ -677,7 +917,7 @@ local function dropdownControl(container, d, multiple)
         caption.Text = multiple and (#value > 0 and table.concat(value, ", ") or "none selected")
             or (value ~= "" and value or "no options")
     end
-    table.insert(syncs[d.key], sync); sync()
+    registerSync(d.key, sync); sync()
     local pick = hit(field, "Expand", 0, 0, 214, 24)
     hoverRow(frame, pick)
     connect(pick.Activated, function()
@@ -745,8 +985,9 @@ controls.color = function(container, d)
         if caption then caption.Text = "#" .. value:ToHex():upper() end
         tween(preview, animated and 0.16 or 0, {BackgroundColor3 = value})
     end
-    table.insert(syncs[d.key], sync); sync(false)
+    registerSync(d.key, sync); sync(false)
     local pick = hit(field, "PickColor", 0, 0, d.inline and 24 or 214, 24)
+    pick.Selectable = false
     hoverRow(frame, pick)
     connect(pick.Activated, function()
         if popup.anchor == field then closePopup(); return end
@@ -909,7 +1150,7 @@ controls.color = function(container, d)
             end)
             -- State syncs run synchronously, unlike deferred BindableEvent listeners.
             local function modelSync(animated) refresh(animated, inputOrigin == "hsv", inputOrigin == nil) end
-            table.insert(syncs[d.key], modelSync)
+            registerSync(d.key, modelSync)
             refresh(false, false, true)
             return {
                 commit = flush,
@@ -974,6 +1215,23 @@ controls.button = function(container, d)
     end)
 end
 
+for kind, constructor in pairs(controls) do
+    controls[kind] = function(container, definition)
+        local owner = Scope.new(instanceScopes[container] or rootScope)
+        local previousScope = currentScope; currentScope = owner
+        local ok, frame = pcall(constructor, container, definition)
+        currentScope = previousScope
+        if not ok then owner:Destroy(); error(frame, 0) end
+        owner:Own(frame)
+        owner:Connect(frame.Destroying, function() owner:Forget(frame); owner:Destroy() end)
+        owner:Add(function()
+            local index = definition.frames and table.find(definition.frames, frame)
+            if index then table.remove(definition.frames, index) end
+        end)
+        return frame
+    end
+end
+
 ----------------------------------------------------------------------
 -- window
 ----------------------------------------------------------------------
@@ -981,6 +1239,7 @@ gui = new("ScreenGui", parent, {
     Name = windowOptions.id, ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 50, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
+rootScope:Own(gui)
 -- Composite opacity leaves local text/stroke/hover animation values intact.
 root = new("Frame", gui, {
     Name = "Window", Size = UDim2.fromOffset(600, 370),
@@ -1023,17 +1282,22 @@ closePopup = function(immediate)
     if current.commit then current.commit() end
     popup.current = nil; popup.anchor = nil; activePicker = nil
     if current.dispose then current.dispose() end
-    for _, connection in ipairs(current.connections) do connection:Disconnect() end
     if current.onClose then current.onClose() end
     if immediate or destroyed then
-        current.overlay:Destroy()
+        current.scope:Destroy()
     else
-        afterTween(tween(current.panel, 0.12, {FadeTransparency = 1}), function() current.overlay:Destroy() end)
+        closingPopups[current] = true
+        afterTween(tween(current.panel, 0.12, {FadeTransparency = 1}), function()
+            closingPopups[current] = nil; current.scope:Destroy()
+        end)
     end
 end
 openPopup = function(anchor, width, height, build, onClose)
     if destroyed or unloading or not api.Open then return end
     closePopup(true)
+    for old in pairs(closingPopups) do closingPopups[old] = nil; old.scope:Destroy() end
+    local previousScope = currentScope
+    local owner = Scope.new(rootScope); currentScope = owner
     local factor = math.max(0.01, root.AbsoluteSize.X / 600)
     local relative = (anchor.AbsolutePosition - root.AbsolutePosition) / factor
     local x = math.clamp(relative.X, 8, 600 - width - 8)
@@ -1041,6 +1305,7 @@ openPopup = function(anchor, width, height, build, onClose)
     if y + height > 362 then y = math.max(8, relative.Y - height - 5) end
     local overlay = hit(root, "PopupOverlay", 0, 0, 600, 370)
     overlay.ZIndex = 120
+    owner:Own(overlay)
     local panel = new("Frame", overlay, {
         Name = "Popup", Position = UDim2.fromOffset(x, y + 4), Size = UDim2.fromOffset(width, height),
         BackgroundColor3 = C.panel, BorderSizePixel = 0, FadeTransparency = 1, ZIndex = 2,
@@ -1052,21 +1317,21 @@ openPopup = function(anchor, width, height, build, onClose)
     -- Sink clicks on the panel itself instead of forwarding them to the overlay.
     local panelHit = hit(panel, "PanelHit", 0, 0, width, height)
     panelHit.ZIndex = 0
-    local record = {overlay = overlay, panel = panel, connections = {}, onClose = onClose}
+    local record = {overlay = overlay, panel = panel, scope = owner, onClose = onClose}
     popup.current = record; popup.anchor = anchor
     local function listen(signal, callback)
-        local connection = signal:Connect(function(...)
-            if popup.current == record and not destroyed then callback(...) end
+        return owner:Connect(signal, function(...)
+            if popup.current == record and not destroyed and not record.closing then callback(...) end
         end)
-        table.insert(record.connections, connection)
-        return connection
     end
     local function close() if popup.current == record then closePopup() end end
     listen(overlay.Activated, close)
     listen(Input.InputBegan, function(input)
         if input.KeyCode == Enum.KeyCode.Escape then close() end
     end)
-    local lifecycle = build(panel, listen, close)
+    local ok, lifecycle = pcall(build, panel, listen, close)
+    currentScope = previousScope
+    if not ok then popup.current = nil; popup.anchor = nil; owner:Destroy(); error(lifecycle, 0) end
     if type(lifecycle) == "table" then record.commit, record.dispose = lifecycle.commit, lifecycle.dispose end
     tween(panel, 0.18, {Position = UDim2.fromOffset(x, y), FadeTransparency = 0})
 end
@@ -1213,21 +1478,49 @@ connect(scroll.MouseLeave, function() tween(scroll, 0.16, {ScrollBarImageTranspa
 scroll:SetAttribute("x", 16)
 table.insert(searchPage.columns, scroll)
 section(scroll, "Search", 508)
-local resultItems = {}
-local function registerSearchItem(d)
-    if d.searchable == false then return end
+local resultItems, searchEntries = {}, {}
+local searchClock = 0
+local function createSearchItem(d)
+    local previousScope = currentScope
+    local owner = Scope.new(rootScope); currentScope = owner
     local item = new("Frame", scroll, {
         Name = "Result_" .. d.key, BackgroundTransparency = 1,
         BorderSizePixel = 0, Visible = false, FadeTransparency = 1,
         Size = UDim2.fromOffset(244, 64),
     })
-    local control = controls[d.kind](item, d)
+    owner:Own(item)
+    owner:Connect(item.Destroying, function() owner:Forget(item); owner:Destroy() end)
+    local ok, control = pcall(controls[d.kind], item, d)
+    if not ok then currentScope = previousScope; owner:Destroy(); error(control, 0) end
     control.Position = UDim2.fromOffset(1, 1)
     item.Size = UDim2.fromOffset(244, control.Size.Y.Offset + 2)
     new("UIScale", item, {Scale = 1})
+    currentScope = previousScope
     resultItems[d.key] = item
+    searchEntries[d.key] = {scope=owner, touched=searchClock}
+    if d.decorate then
+        local previous = currentScope; currentScope = instanceScopes[control]
+        d.decorate(control)
+        currentScope = previous
+    end
+    return item
 end
-for _, d in ipairs(defs) do registerSearchItem(d) end
+local function pruneSearch(active)
+    local count, candidates = 0, {}
+    for key, entry in pairs(searchEntries) do
+        count = count + 1
+        if not active or (not resultItems[key]:GetAttribute("Matched") and not resultItems[key].Visible) then candidates[#candidates + 1] = {key=key, touched=entry.touched} end
+    end
+    table.sort(candidates, function(a,b) return a.touched < b.touched end)
+    local limit = windowOptions.searchCacheLimit or 32
+    for _, candidate in ipairs(candidates) do
+        if count <= limit then break end
+        local key = candidate.key
+        local entry = searchEntries[key]
+        searchEntries[key] = nil; resultItems[key] = nil
+        entry.scope:Destroy(); count = count - 1
+    end
+end
 local empty = label(scroll, "Empty", "nothing found", 0, 28, 508, 24, C.text, 13)
 tween(empty, 0, {TextTransparency = 1})
 empty.Visible = false
@@ -1252,7 +1545,10 @@ local function showPage(page, dir)
             local outgoing = p
             tween(outgoing.frame, 0.18, {Position = UDim2.fromOffset(-dir * 8, 0)})
             afterTween(tween(outgoing.frame, 0.18, {FadeTransparency = 1}), function()
-                if outgoing ~= current then outgoing.frame.Visible = false end
+                if outgoing ~= current then
+                    outgoing.frame.Visible = false
+                    if outgoing == searchPage and #search.Text < 2 then pruneSearch(false) end
+                end
             end)
         end
     end
@@ -1275,16 +1571,19 @@ local filterRevision = 0
 local function showDesired(dir)
     local query = string.lower(search.Text)
     local active = #query >= 2
+    searchClock = searchClock + 1
     if active then
         filterRevision = filterRevision + 1
         local revision = filterRevision
         local count, y, rowHeight = 0, 28, 0
         for _, d in ipairs(defs) do
+            local matched = d.searchable ~= false and d.hidden ~= true and string.find(string.lower(d.text), query, 1, true) ~= nil
             local item = resultItems[d.key]
+            if matched and not item then item = createSearchItem(d) end
             if item then
-            local matched = d.hidden ~= true and string.find(string.lower(d.text), query, 1, true) ~= nil
             item:SetAttribute("Matched", matched)
             if matched then
+                searchEntries[d.key].touched = searchClock
                 local column = count % 2
                 if column == 0 and count > 0 then y = y + rowHeight + 8; rowHeight = 0 end
                 local target = UDim2.fromOffset(column * 250 + 1, y)
@@ -1301,7 +1600,7 @@ local function showDesired(dir)
             elseif item.Visible then
                 local outgoing = item
                 afterTween(tween(outgoing, 0.12, {FadeTransparency = 1}), function()
-                    if not outgoing:GetAttribute("Matched") then outgoing.Visible = false end
+                    if not outgoing:GetAttribute("Matched") then outgoing.Visible = false; pruneSearch(true) end
                 end)
             end
             end
@@ -1313,6 +1612,7 @@ local function showDesired(dir)
         end)
         tween(scroll, 0.18, {CanvasSize = UDim2.fromOffset(0, count > 0 and y + rowHeight + 4 or 56), CanvasPosition = Vector2.zero})
     end
+    if active then pruneSearch(true) elseif not searchPage.frame.Visible then pruneSearch(false) end
     showPage(active and searchPage or pages[api.Tab + 1], dir)
 end
 connect(search:GetPropertyChangedSignal("Text"), function()
@@ -1381,7 +1681,7 @@ local function rebuildTabs()
     for i = 1, #tabs do styleTab(i, i - 1 == api.Tab, false) end
     moveMarker(api.Tab, false)
 end
-table.insert(refreshers, function()
+registerRefresher(function()
     for i = 1, #tabs do styleTab(i, i - 1 == api.Tab, true) end
 end)
 
@@ -1494,7 +1794,9 @@ function api:ExportConfig()
     end
     local theme = {}
     for name, color in pairs(C) do theme[name] = color:ToHex() end
-    return HttpService:JSONEncode({format = "SourceMenu", version = 1, values = values, theme = theme, keybind = menuKey.Name})
+    local json = HttpService:JSONEncode({format = "SourceMenu", version = 1, values = values, theme = theme, keybind = menuKey.Name})
+    assert(#json <= 131072, "Config exceeds 128 KiB; reduce long input values")
+    return json
 end
 function api:ImportConfig(json)
     if destroyed or unloading then return false, "Menu is unavailable" end
@@ -1556,6 +1858,8 @@ function api:ImportConfig(json)
     return ok, ok and "Config loaded" or tostring(result)
 end
 local sessionConfigs = {}
+local configBytes = 0
+local configBudget = 2097152
 local function configName(name)
     assert(type(name) == "string", "Config name must be text")
     name = name:match("^%s*(.-)%s*$")
@@ -1572,7 +1876,10 @@ function api:SaveConfig(name)
     assert(not destroyed and not unloading, "Menu is unavailable")
     name = configName(name)
     assert(sessionConfigs[name] or #self:ListConfigs() < 32, "A session can contain up to 32 configs")
-    sessionConfigs[name] = self:ExportConfig()
+    local json = self:ExportConfig()
+    local nextSize = configBytes - #(sessionConfigs[name] or "") + #json
+    if nextSize > configBudget then return false, "Session config budget is 2 MiB; delete or export an old profile" end
+    sessionConfigs[name] = json; configBytes = nextSize
     self:SetOptions("configProfile", self:ListConfigs())
     self:Set("configProfile", name)
     return true
@@ -1586,6 +1893,7 @@ function api:DeleteConfig(name)
     if destroyed or unloading then return false, "Menu is unavailable" end
     name = configName(name)
     if not sessionConfigs[name] then return false, "Config not found" end
+    configBytes = configBytes - #sessionConfigs[name]
     sessionConfigs[name] = nil
     self:SetOptions("configProfile", self:ListConfigs())
     return true
@@ -1648,7 +1956,6 @@ function api:AddControl(kind, options, column, host)
     if d.callback and kind ~= "button" then hooks[d.key] = function(value) d.callback(value, api) end end
     local targetColumn = options.tab == "settings" and settingsPage.columns[column] or elementColumns[column]
     local frame = controls[kind](host or targetColumn, d)
-    registerSearchItem(d)
     if #search.Text >= 2 then showDesired(1) end
     local replicas = {frame}
     if resultItems[d.key] then
@@ -1665,7 +1972,7 @@ function api:AddControl(kind, options, column, host)
     function handle:SetOptions(value) api:SetOptions(d.key, value); return self end
     function handle:OnChanged(callback)
         assert(type(callback) == "function", "OnChanged requires a callback")
-        return connect(api.Changed, function(key, value)
+        return (instanceScopes[frame] or rootScope):Connect(api.Changed, function(key, value)
             if key == d.key then
                 local ok, message = pcall(callback, copyValue(value))
                 if not ok then warn("Source UI OnChanged (" .. key .. "): " .. tostring(message)) end
@@ -1731,6 +2038,25 @@ function api:AddControl(kind, options, column, host)
         arrangeAccessories()
         return settingsPanel
     end
+    d.decorate = function(replica)
+        replicas[#replicas + 1] = replica
+        if attachedColor then
+            local mirror = controls.color(replica, byKey[attachedColor.Key])
+            mirror.Position = attachedColor.Frame.Position; mirror.ZIndex = 5
+            table.insert(byKey[attachedColor.Key].frames, mirror)
+        end
+        if settingsPanel then
+            local gear = hit(replica, "MiniSettings", kind == "toggle" and 164 or 206, 7, 24, 24)
+            gear.ZIndex = 6
+            local glyph = icon(gear, "settings", 4, 4, 16, C.inactive)
+            -- Use the replica owner, so evicting a search row releases its listeners.
+            local owner = instanceScopes[replica]
+            owner:Connect(gear.MouseEnter, function() tween(glyph, 0.16, {ImageColor3=C.accent, Rotation=30}) end)
+            owner:Connect(gear.MouseLeave, function() tween(glyph, 0.16, {ImageColor3=C.inactive, Rotation=0}) end)
+            owner:Connect(gear.Activated, function() settingsPanel:Toggle(replica) end)
+        end
+        arrangeAccessories()
+    end
     if options.color then handle.Color = handle:AddColorPicker(options.color, options.colorSide) end
     if options.settings then
         handle.Settings = handle:AddSettings({title = options.settingsTitle or d.text})
@@ -1780,8 +2106,10 @@ function api:CreateMiniSettings(anchor, options)
     assert(anchor and anchor:IsA("GuiObject"), "Mini settings need a control anchor")
     local height = options.height or 224
     assert(type(height) == "number" and height >= 160 and height <= 288, "Mini height must be 160..288")
+    local previousScope = currentScope
+    local owner = Scope.new(rootScope); currentScope = owner
     local overlay = hit(root, "MiniOverlay", 0, 0, 600, 370)
-    overlay.ZIndex = 110; overlay.Visible = false
+    overlay.ZIndex = 110; overlay.Visible = false; owner:Own(overlay)
     local panel = new("Frame", overlay, {
         Name = "MiniSettingsPanel", Size = UDim2.fromOffset(254, height),
         BackgroundColor3 = C.panel, BorderSizePixel = 0, FadeTransparency = 1, ZIndex = 2,
@@ -1843,24 +2171,28 @@ function api:CreateMiniSettings(anchor, options)
     connect(dismiss.MouseLeave, function() tween(dismiss, 0.16, {TextColor3 = titleColor}) end)
     connect(body.MouseEnter, function() tween(body, 0.16, {ScrollBarImageTransparency = 0.05}) end)
     connect(body.MouseLeave, function() tween(body, 0.16, {ScrollBarImageTransparency = 0.45}) end)
+    currentScope = previousScope
     return mini
 end
 connect(Input.InputBegan, function(input)
     if input.KeyCode == Enum.KeyCode.Escape and not popup.current then closeMini() end
 end)
 function api:SetMotionSpeed(value)
+    if destroyed or unloading then return self end
     assert(type(value) == "number" and value >= 0.25 and value <= 3, "Motion speed must be 0.25..3")
     motionSpeed = value
     if byKey.motionSpeed and self.State.motionSpeed ~= value then self:Set("motionSpeed", value) end
     return self
 end
 function api:SetKeybind(key)
+    if destroyed or unloading then return self end
     assert(typeof(key) == "EnumItem" and key.EnumType == Enum.KeyCode, "Use Enum.KeyCode")
     menuKey = key
     if keyHint then keyHint:FindFirstChild("Value", true).Text = key.Name end
     return self
 end
 function api:SetTheme(theme)
+    if destroyed or unloading then return self end
     assert(type(theme) == "table", "Theme must be a table")
     for name, color in pairs(theme) do
         assert(C[name] ~= nil and typeof(color) == "Color3", "Unknown theme token or invalid color: " .. tostring(name))
@@ -1894,6 +2226,21 @@ function api:SetTheme(theme)
     return self
 end
 function api:GetTheme() return copyValue(C) end
+function api:GetResourceStats()
+    local stats = rootScope:Counts()
+    stats.destroyed = destroyed
+    stats.visuals = 0; stats.alphaProxies = 0; stats.activeTweens = 0; stats.searchRows = 0; stats.syncCallbacks = 0
+    for _, record in pairs(visuals) do
+        stats.visuals = stats.visuals + 1
+        for _ in pairs(record.channels) do stats.alphaProxies = stats.alphaProxies + 1 end
+    end
+    for _, channels in pairs(activeTweens) do for _ in pairs(channels) do stats.activeTweens = stats.activeTweens + 1 end end
+    for _ in pairs(resultItems) do stats.searchRows = stats.searchRows + 1 end
+    for _, callbacks in pairs(syncs) do stats.syncCallbacks = stats.syncCallbacks + #callbacks end
+    stats.configBytes = configBytes; stats.configBudget = configBudget
+    stats.renderActive = renderConnection ~= nil and renderConnection.Connected
+    return stats
+end
 function api:GetIconCacheInfo()
     local loaded = 0
     for _, state in pairs(iconCache.assets) do if state == true then loaded = loaded + 1 end end
@@ -1961,6 +2308,7 @@ function api:CreateTab(options)
     return tab
 end
 function api:GetSettingsTab()
+    assert(not destroyed and not unloading, "Window is unavailable")
     if not settingsPage.builder then
         settingsPage.builder = makeBuilder(settingsPage.columns)
         settingsPage.builder.Frame = settingsPage.frame
@@ -2156,8 +2504,8 @@ function api:SetOpen(open)
     -- The helper cancels the previous tween before starting from its current value.
     local animation = tween(openness, duration, {Value = target}, Enum.EasingStyle.Quad)
     local finished
-    finished = animation.Completed:Connect(function(state)
-        finished:Disconnect()
+    finished = rootScope:Connect(animation.Completed, function(state)
+        rootScope:Disconnect(finished)
         if destroyed or revision ~= openRevision or state ~= Enum.PlaybackState.Completed then return end
         root.Visible = self.Open
         winVeil.Visible = false
@@ -2188,9 +2536,27 @@ connect(gui.Destroying, function()
     end
     table.clear(activeTweens)
     table.clear(positionFollowers)
-    for _, connection in ipairs(connections) do connection:Disconnect() end
-    table.clear(connections)
-    changed:Destroy()
+    rootScope:Forget(gui)
+    rootScope:Destroy()
+    table.clear(dirtyVisuals); table.clear(dirtyScopes)
+    table.clear(visuals); table.clear(fades); table.clear(scopeMembers)
+    table.clear(themeBindings); table.clear(editors); table.clear(instanceScopes)
+    table.clear(closingPopups)
+    table.clear(syncs); table.clear(hooks); table.clear(refreshers); table.clear(accentItems)
+    for _, definition in ipairs(defs) do if definition.frames then table.clear(definition.frames) end; definition.decorate = nil end
+    table.clear(defs); table.clear(byKey); table.clear(api.State)
+    table.clear(resultItems); table.clear(searchEntries); table.clear(sessionConfigs); configBytes = 0
+    table.clear(pages); table.clear(elementColumns)
+    current = nil; selectedPage = nil
+    table.clear(tabs); table.clear(api.Tabs)
+    table.clear(settingsPage.columns); settingsPage.frame = nil; settingsPage.builder = nil
+    changed:Destroy(); changed = nil; api.Changed = nil
+    renderConnection = nil
+    root = nil; header = nil; content = nil; search = nil; scroll = nil; empty = nil
+    marker = nil; navigation = nil; border = nil; winVeil = nil; veil = nil; avatar = nil
+    tabTitle = nil; keyHint = nil; scale = nil; intro = nil; userScale = nil; openness = nil
+    fab = nil; fabScale = nil; fabHit = nil; noSelection = nil
+    table.clear(windowOptions)
 end)
 
 do
@@ -2233,6 +2599,7 @@ function Library:CreateWindow(options)
     config.id = config.id or ("SourceUI_" .. windowSerial)
     assert(type(config.id) == "string" and #config.id > 0, "Window id must be a non-empty string")
     assert(config.title == nil or type(config.title) == "string", "Window title must be text")
+    assert(config.searchCacheLimit == nil or type(config.searchCacheLimit) == "number" and config.searchCacheLimit >= 0 and config.searchCacheLimit <= 128 and config.searchCacheLimit % 1 == 0, "searchCacheLimit must be 0..128")
     assert(config.open == nil or type(config.open) == "boolean", "Window open must be boolean")
     assert(config.motionSpeed == nil or type(config.motionSpeed) == "number" and config.motionSpeed >= 0.25 and config.motionSpeed <= 3, "Motion speed must be 0.25..3")
     assert(config.keybind == nil or typeof(config.keybind) == "EnumItem" and config.keybind.EnumType == Enum.KeyCode, "Use Enum.KeyCode")
